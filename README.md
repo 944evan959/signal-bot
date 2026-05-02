@@ -19,6 +19,9 @@ Works in a group chat for everyone, and as a private assistant in DMs for the ow
 | `/doc edit <instruction>` | Group + DM | Admins (group) / owner (DM) | AI rewrites the document |
 | `/group claim` | Group only | Owner | Approves the current group for bot use |
 | `/group leave` | Group only | Owner | Removes the current group from approved set |
+| `/admins` | Group + DM | Admins (group) / owner (DM) | List the configured owner and admin IDs |
+| `/admins add <id>` | Group + DM | Owner | Add an admin at runtime (persisted to `data/admins.txt`) |
+| `/admins remove <id>` | Group + DM | Owner | Remove a runtime-added admin (env-based admins are pinned) |
 | `@bot <question>` *(native Signal mention or text)* | Group only | Everyone | Answers any question |
 | *(any text)* | DM only | Owner | Treated as an `@<BOT_NAME>` query |
 
@@ -226,7 +229,8 @@ signal-ollama-bot/
 ├── data/
 │   ├── document.md     # the shared document (auto-created)
 │   ├── persona.md      # bot identity + relational context (auto-created)
-│   └── groups.txt      # auto-onboarded group IDs (managed by the bot)
+│   ├── groups.txt      # claimed group IDs (managed via /group claim)
+│   └── admins.txt      # runtime-added admins (managed via /admins add)
 └── signal-config/      # Signal keys, owned by signal-api (auto-created)
 ```
 

@@ -59,6 +59,7 @@ BOT_NAME         = os.environ.get("BOT_NAME", "Claude")
 DOC_PATH         = Path(os.environ.get("DOC_PATH", "document.md"))
 PERSONA_PATH     = Path(os.environ.get("PERSONA_PATH", "persona.md"))
 GROUPS_FILE      = Path(os.environ.get("GROUPS_FILE", "groups.txt"))
+ADMINS_FILE      = Path(os.environ.get("ADMINS_FILE", "admins.txt"))
 MAX_INLINE_CHARS = int(os.environ.get("MAX_INLINE_CHARS", "1500"))
 MAX_INSTRUCTION  = int(os.environ.get("MAX_INSTRUCTION", "500"))
 MAX_QUERY_CHARS  = int(os.environ.get("MAX_QUERY_CHARS",  "1000"))
@@ -205,7 +206,9 @@ def _query_needs_search(query: str) -> bool:
 
 
 def ai_edit_doc(doc: str, instruction: str) -> str:
-    """Apply an edit instruction to a markdown document via Ollama."""
+    """Apply an edit instruction to a markdown document via Ollama. Raises
+    ValueError if the model returns empty/blank content so the caller can
+    surface a real failure instead of silently overwriting the doc with ''."""
     client   = _ollama_client()
     response = client.chat.completions.create(
         model=_MODEL_EDIT,
@@ -215,7 +218,10 @@ def ai_edit_doc(doc: str, instruction: str) -> str:
             {"role": "user",   "content": f"Document:\n\n{doc}\n\nInstruction: {instruction}"},
         ],
     )
-    return response.choices[0].message.content.strip()
+    new_doc = response.choices[0].message.content.strip()
+    if not new_doc:
+        raise ValueError("Model returned empty content")
+    return new_doc
 
 
 def _answer(query: str, ddg_context: str = "") -> str:
@@ -318,12 +324,45 @@ def is_allowed_group(group_id: str | None) -> bool:
         return True
     return group_id in _load_known_groups()
 
+def _load_file_admins() -> set[str]:
+    """Read the runtime-managed admin set from ADMINS_FILE."""
+    if not ADMINS_FILE.exists():
+        return set()
+    return {ln.strip() for ln in ADMINS_FILE.read_text().splitlines() if ln.strip()}
+
+
+def _save_file_admin(admin_id: str) -> bool:
+    """Add admin_id to ADMINS_FILE. Returns True if added, False if already present."""
+    ids = _load_file_admins()
+    if admin_id in ids:
+        return False
+    ids.add(admin_id)
+    ADMINS_FILE.write_text("\n".join(sorted(ids)) + "\n")
+    return True
+
+
+def _remove_file_admin(admin_id: str) -> bool:
+    """Remove admin_id from ADMINS_FILE. Returns True if removed, False if absent."""
+    ids = _load_file_admins()
+    if admin_id not in ids:
+        return False
+    ids.discard(admin_id)
+    ADMINS_FILE.write_text(("\n".join(sorted(ids)) + "\n") if ids else "")
+    return True
+
+
+def _all_admins() -> set[str]:
+    """Combined admin set: env-configured plus file-persisted."""
+    return ADMIN_IDS | _load_file_admins()
+
+
 def is_admin(source: str, source_uuid: str) -> bool:
     """Checks phone number OR UUID so username-only Signal users are supported."""
-    if not ADMIN_IDS:
-        log.warning("ADMIN_IDS not set — all write commands disabled.")
+    ids = _all_admins()
+    if not ids:
+        log.warning("No admins configured — all write commands disabled.")
         return False
-    return bool(ADMIN_IDS & {source, source_uuid})
+    return bool(ids & {source, source_uuid})
 
 
 def is_owner(source: str, source_uuid: str) -> bool:
@@ -512,6 +551,83 @@ def handle_mention(recipient: str, query: str):
         send(recipient, "❌ Search failed. Please try again.")
 
 
+ADMINS_HELP = (
+    "👥 *Admin commands:*\n"
+    "`/admins`              — list owner and admins\n"
+    "`/admins add <id>`     — add an admin *(owner only)*\n"
+    "`/admins remove <id>`  — remove a runtime-added admin *(owner only)*\n\n"
+    "Use phone numbers (`+15551234567`) or UUIDs. Admins added via `.env`\n"
+    "are pinned and can't be removed at runtime — edit `.env` instead."
+)
+
+
+def _list_admins(recipient: str):
+    file_ids = _load_file_admins()
+    all_ids  = ADMIN_IDS | file_ids
+
+    lines = []
+    lines.append(f"👑 *Owner:* `{OWNER_ID}`" if OWNER_ID else "👑 *Owner:* _not set_")
+
+    if all_ids:
+        lines.append(f"\n👥 *Admins ({len(all_ids)}):*")
+        for aid in sorted(all_ids):
+            origin = "env" if aid in ADMIN_IDS else "file"
+            lines.append(f"• `{aid}` _({origin})_")
+    else:
+        lines.append("\n👥 *Admins:* _none configured_")
+
+    send(recipient, "\n".join(lines))
+
+
+def handle_admins(recipient: str, args: str, source: str, source_uuid: str):
+    args = args.strip()
+
+    if args in ("", "list"):
+        _list_admins(recipient)
+        return
+
+    # Add / remove are owner-only
+    if args.startswith("add ") or args.startswith("remove ") or args.startswith("rm "):
+        if not is_owner(source, source_uuid):
+            send(recipient, "🔒 Only the owner can modify the admin list.")
+            log.info("Admin-mutation denied source=%s uuid=%s", source, source_uuid)
+            return
+
+    if args.startswith("add "):
+        admin_id = args[4:].strip()
+        if not admin_id or " " in admin_id or len(admin_id) > 128:
+            send(recipient, "⚠️ Usage: `/admins add <phone-or-uuid>`")
+            return
+        if admin_id in ADMIN_IDS:
+            send(recipient, f"⚠️ `{admin_id}` is already configured via `.env`.")
+            return
+        if _save_file_admin(admin_id):
+            log.info("Admin added: %s by owner=%s", admin_id, source)
+            send(recipient, f"✅ Added admin: `{admin_id}`")
+        else:
+            send(recipient, f"⚠️ `{admin_id}` is already an admin.")
+        return
+
+    if args.startswith("remove ") or args.startswith("rm "):
+        admin_id = args.split(maxsplit=1)[1].strip() if " " in args else ""
+        if not admin_id:
+            send(recipient, "⚠️ Usage: `/admins remove <phone-or-uuid>`")
+            return
+        if admin_id in ADMIN_IDS and admin_id not in _load_file_admins():
+            send(recipient,
+                 f"⚠️ `{admin_id}` is configured via `.env`. Remove it from "
+                 f"`.env` and force-recreate the container instead.")
+            return
+        if _remove_file_admin(admin_id):
+            log.info("Admin removed: %s by owner=%s", admin_id, source)
+            send(recipient, f"✅ Removed admin: `{admin_id}`")
+        else:
+            send(recipient, f"⚠️ `{admin_id}` is not in the admin list.")
+        return
+
+    send(recipient, ADMINS_HELP)
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # MESSAGE ROUTER
 # ════════════════════════════════════════════════════════════════════════════════
@@ -541,6 +657,8 @@ def route(envelope: dict):
         log.info("DM source=%s uuid=%s", source, source_uuid)
         if text.startswith("/doc"):
             handle_doc(recipient, text[4:], source, source_uuid)
+        elif text.strip().startswith("/admins"):
+            handle_admins(recipient, text.strip()[7:], source, source_uuid)
         else:
             # In DMs every message is treated as a search query — no @mention needed
             handle_mention(recipient, sanitize_query(text))
@@ -566,6 +684,15 @@ def route(envelope: dict):
         _remove_known_group(group_id)
         log.info("Group released: %s by owner=%s", group_id, source)
         send(recipient, "👋 Group released. I'll stop responding here.")
+        return
+
+    # /admins — list / add / remove. Read is admin-or-owner; mutations are
+    # checked inside handle_admins (owner only).
+    if text.strip().startswith("/admins"):
+        if is_owner(source, source_uuid) or is_admin(source, source_uuid):
+            handle_admins(recipient, text.strip()[7:], source, source_uuid)
+        else:
+            send(recipient, "🔒 Only admins can use the admins command.")
         return
 
     mentions = data.get("mentions") or []

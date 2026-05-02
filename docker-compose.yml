@@ -41,6 +41,7 @@ services:
       - DOC_PATH=/data/document.md
       - PERSONA_PATH=/data/persona.md
       - GROUPS_FILE=/data/groups.txt
+      - ADMINS_FILE=/data/admins.txt
       - MAX_QUERY_CHARS=${MAX_QUERY_CHARS-1000}
       - RATE_LIMIT_MAX=${RATE_LIMIT_MAX-10}
       - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW-60}
