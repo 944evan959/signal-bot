@@ -1,0 +1,14 @@
+# Signal API
+requests>=2.32.0
+python-dotenv>=1.0.0
+
+# WebSocket consumer for json-rpc receive mode
+websocket-client>=1.7.0
+
+# Ollama — uses OpenAI-compatible API
+openai>=1.0.0
+
+# DuckDuckGo web search backend. Only needed when SEARCH_FALLBACK is set to
+# `auto` or `duckduckgo`. Commented out by default to keep the dependency
+# surface small — uncomment if you want web-grounded answers.
+# ddgs>=9.0.0

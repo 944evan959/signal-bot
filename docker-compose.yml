@@ -1,0 +1,73 @@
+services:
+
+  # ── Signal REST API ──────────────────────────────────────────────────────────
+  signal-api:
+    image: bbernhard/signal-cli-rest-api:0.99
+    container_name: signal-api
+    restart: unless-stopped
+    environment:
+      - MODE=json-rpc
+    # ⚠️  No 'ports:' mapping — the API is internal only.
+    # The bot reaches it via Docker's internal network (http://signal-api:8080).
+    #
+    # For initial setup (register / verify), temporarily uncomment this,
+    # then remove it again once registration is complete:
+    #
+    ports:
+      - "127.0.0.1:8080:8080"   # loopback only — never 0.0.0.0
+    volumes:
+      - ./signal-config:/home/.local/share/signal-cli
+    networks:
+      - internal
+
+  # ── Bot ───────────────────────────────────────────────────────────────────────
+  bot:
+    build: .
+    container_name: signal-ollama-bot
+    restart: unless-stopped
+    depends_on:
+      - signal-api
+    environment:
+      - SIGNAL_SERVICE=http://signal-api:8080
+      - BOT_NAME=${BOT_NAME:-Claude}
+      - ALLOWED_GROUP=${ALLOWED_GROUP}
+      - ADMIN_IDS=${ADMIN_IDS}
+      - OWNER_ID=${OWNER_ID}
+      - BOT_UUID=${BOT_UUID}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
+      - MODEL_EDIT=${MODEL_EDIT:-llama3.3}
+      - MODEL_SEARCH=${MODEL_SEARCH:-llama3.3}
+      - SEARCH_FALLBACK=${SEARCH_FALLBACK-auto}
+      - DOC_PATH=/data/document.md
+      - PERSONA_PATH=/data/persona.md
+      - GROUPS_FILE=/data/groups.txt
+      - MAX_QUERY_CHARS=${MAX_QUERY_CHARS-1000}
+      - RATE_LIMIT_MAX=${RATE_LIMIT_MAX-10}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW-60}
+    secrets:
+      - bot_number
+    volumes:
+      - ./data:/data
+    networks:
+      - internal
+    # ── Container hardening ──────────────────────────────────────────────────
+    read_only: true                # immutable rootfs; volumes still writable
+    tmpfs:
+      - /tmp                       # Python / requests scratch space
+    cap_drop:
+      - ALL                        # bot needs no Linux capabilities
+    security_opt:
+      - no-new-privileges:true     # block setuid privilege escalation
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+
+secrets:
+  bot_number:
+    file: ./secrets/bot_number.txt
+
+networks:
+  internal:
+    driver: bridge
