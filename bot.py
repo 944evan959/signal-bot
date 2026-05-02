@@ -75,7 +75,10 @@ MAX_DOC_INPUT_CHARS = int(os.environ.get("MAX_DOC_INPUT_CHARS", "20000"))
 # Per-call ceilings on every Ollama chat completion. max_tokens stops
 # runaway generation (e.g. "recite the entire bee movie script"); timeout
 # stops a stalled / looping model from hanging the bot indefinitely.
-LLM_MAX_TOKENS      = int(os.environ.get("LLM_MAX_TOKENS", "8000"))
+# Default ~3000 tokens ≈ 12K chars output — fits most doc edits and Q&A
+# while bounding runaway behavior. Bump in .env if you hit truncations
+# on large /doc edit operations.
+LLM_MAX_TOKENS      = int(os.environ.get("LLM_MAX_TOKENS", "3000"))
 LLM_TIMEOUT         = int(os.environ.get("LLM_TIMEOUT",   "180"))
 # Send a "still working" nudge if a /doc edit hasn't completed in this many
 # seconds. Set to 0 to disable.
