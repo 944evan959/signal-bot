@@ -33,6 +33,8 @@ import re
 import time
 import logging
 import base64
+import threading
+import concurrent.futures
 import requests
 import websocket
 from datetime import datetime
@@ -60,9 +62,24 @@ DOC_PATH         = Path(os.environ.get("DOC_PATH", "document.md"))
 PERSONA_PATH     = Path(os.environ.get("PERSONA_PATH", "persona.md"))
 GROUPS_FILE      = Path(os.environ.get("GROUPS_FILE", "groups.txt"))
 ADMINS_FILE      = Path(os.environ.get("ADMINS_FILE", "admins.txt"))
-MAX_INLINE_CHARS = int(os.environ.get("MAX_INLINE_CHARS", "1500"))
-MAX_INSTRUCTION  = int(os.environ.get("MAX_INSTRUCTION", "500"))
-MAX_QUERY_CHARS  = int(os.environ.get("MAX_QUERY_CHARS",  "1000"))
+MAX_INLINE_CHARS    = int(os.environ.get("MAX_INLINE_CHARS",    "1500"))
+MAX_INSTRUCTION     = int(os.environ.get("MAX_INSTRUCTION",     "500"))
+MAX_QUERY_CHARS     = int(os.environ.get("MAX_QUERY_CHARS",     "1000"))
+# Hard ceiling on persisted document size. write_doc() refuses anything
+# larger, so a runaway model or malicious instruction can't blow up the file.
+MAX_DOC_CHARS       = int(os.environ.get("MAX_DOC_CHARS",       "50000"))
+# Maximum doc size accepted as input to ai_edit_doc(). Edits on docs larger
+# than this are refused with a clear error rather than silently truncated
+# (silent truncation + full-output replace = data loss).
+MAX_DOC_INPUT_CHARS = int(os.environ.get("MAX_DOC_INPUT_CHARS", "20000"))
+# Per-call ceilings on every Ollama chat completion. max_tokens stops
+# runaway generation (e.g. "recite the entire bee movie script"); timeout
+# stops a stalled / looping model from hanging the bot indefinitely.
+LLM_MAX_TOKENS      = int(os.environ.get("LLM_MAX_TOKENS", "8000"))
+LLM_TIMEOUT         = int(os.environ.get("LLM_TIMEOUT",   "180"))
+# Send a "still working" nudge if a /doc edit hasn't completed in this many
+# seconds. Set to 0 to disable.
+PROGRESS_NUDGE_SECONDS = int(os.environ.get("PROGRESS_NUDGE_SECONDS", "30"))
 
 # Per-sender rate limit. Owner is exempt; everyone else gets at most
 # RATE_LIMIT_MAX messages in any RATE_LIMIT_WINDOW-second sliding window.
@@ -168,7 +185,42 @@ _SEARCH_MODE      = os.environ.get("SEARCH_FALLBACK",  "").lower().strip()
 
 def _ollama_client():
     from openai import OpenAI
-    return OpenAI(base_url=_OLLAMA_BASE_URL, api_key="ollama")
+    return OpenAI(base_url=_OLLAMA_BASE_URL, api_key="ollama", max_retries=0)
+
+
+# Long-running shared executor for LLM calls. Each call runs in a worker
+# thread so we can enforce a hard wall-clock timeout — the OpenAI SDK's own
+# timeout doesn't fire reliably against Ollama. A stalled thread keeps
+# running until Ollama eventually completes, but the bot moves on.
+_llm_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="llm",
+)
+
+
+def _call_ollama(*, model: str, messages: list, **kwargs):
+    """Run an Ollama chat completion with a hard wall-clock timeout.
+
+    Raises TimeoutError if LLM_TIMEOUT elapses before the call returns —
+    handle_doc and handle_mention already surface a friendly message for
+    that exception class."""
+    def _do_call():
+        client = _ollama_client()
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=LLM_MAX_TOKENS,
+            timeout=LLM_TIMEOUT,    # SDK's own timeout, best-effort
+            **kwargs,
+        )
+
+    future = _llm_executor.submit(_do_call)
+    try:
+        # Give the SDK a small grace window past LLM_TIMEOUT to surface
+        # APITimeoutError cleanly before our watchdog fires.
+        return future.result(timeout=LLM_TIMEOUT + 5)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"Ollama call exceeded {LLM_TIMEOUT}s")
 
 
 def _ddg_search(query: str, max_results: int = 5) -> str:
@@ -206,11 +258,19 @@ def _query_needs_search(query: str) -> bool:
 
 
 def ai_edit_doc(doc: str, instruction: str) -> str:
-    """Apply an edit instruction to a markdown document via Ollama. Raises
-    ValueError if the model returns empty/blank content so the caller can
-    surface a real failure instead of silently overwriting the doc with ''."""
-    client   = _ollama_client()
-    response = client.chat.completions.create(
+    """Apply an edit instruction to a markdown document via Ollama.
+
+    Raises ValueError if the input doc exceeds MAX_DOC_INPUT_CHARS (refusing
+    rather than silently truncating, since the model's full-doc replacement
+    would lose anything past the truncation point), or if the model returns
+    empty/blank content."""
+    if len(doc) > MAX_DOC_INPUT_CHARS:
+        raise ValueError(
+            f"Document is {len(doc)} chars; max for editing is "
+            f"MAX_DOC_INPUT_CHARS={MAX_DOC_INPUT_CHARS}. Trim it first."
+        )
+
+    response = _call_ollama(
         model=_MODEL_EDIT,
         temperature=0.2,
         messages=[
@@ -236,8 +296,7 @@ def _answer(query: str, ddg_context: str = "") -> str:
     else:
         user_content = query
 
-    client   = _ollama_client()
-    response = client.chat.completions.create(
+    response = _call_ollama(
         model=_MODEL_SEARCH,
         messages=[
             {"role": "system", "content": read_persona()},
@@ -423,6 +482,16 @@ def read_doc() -> str:
     return DOC_PATH.read_text()
 
 def write_doc(content: str):
+    """Persist content to DOC_PATH. Refuses oversized writes and snapshots the
+    previous version to DOC_PATH.bak so a bad edit can be recovered manually."""
+    if len(content) > MAX_DOC_CHARS:
+        raise ValueError(
+            f"Document content {len(content)} chars exceeds "
+            f"MAX_DOC_CHARS={MAX_DOC_CHARS}"
+        )
+    if DOC_PATH.exists():
+        backup = DOC_PATH.with_suffix(DOC_PATH.suffix + ".bak")
+        backup.write_text(DOC_PATH.read_text())
     DOC_PATH.write_text(content)
     log.info("Document saved (%d chars)", len(content))
 
@@ -495,7 +564,10 @@ def handle_doc(recipient: str, args: str, source: str, source_uuid: str):
     if args in ("", "view"):
         content = read_doc()
         if len(content) > MAX_INLINE_CHARS:
-            send(recipient, content[:MAX_INLINE_CHARS] + "\n\n…*(truncated — use `/doc share` for the full file)*")
+            hint = ("use `/doc share` for the full file"
+                    if is_admin(source, source_uuid)
+                    else "ask an admin for the full file")
+            send(recipient, content[:MAX_INLINE_CHARS] + f"\n\n…*(truncated — {hint})*")
         else:
             send(recipient, content)
 
@@ -526,13 +598,46 @@ def handle_doc(recipient: str, args: str, source: str, source_uuid: str):
             log.info("Instruction sanitized/truncated (source=%s)", source)
 
         send(recipient, "✏️ Editing document…")
+        # Schedule a "still working" nudge if the call hasn't completed in
+        # PROGRESS_NUDGE_SECONDS. Cancelled by finally on success/failure.
+        nudge = threading.Timer(
+            PROGRESS_NUDGE_SECONDS,
+            lambda: send(recipient,
+                         f"⏳ Still working… large edits can take up to "
+                         f"{LLM_TIMEOUT}s. Hang tight."),
+        )
+        nudge.start()
         try:
-            new_doc = ai_edit_doc(read_doc(), instruction)
+            old_doc = read_doc()
+            new_doc = ai_edit_doc(old_doc, instruction)
             write_doc(new_doc)
-            send(recipient, f"✅ Done.\n\n{doc_status()}")
+            old_lines = len(old_doc.splitlines())
+            new_lines = len(new_doc.splitlines())
+            delta     = new_lines - old_lines
+            sign      = f"+{delta}" if delta > 0 else str(delta)
+            send(recipient,
+                 f"✅ Done. Lines: {old_lines} → {new_lines} ({sign})\n\n"
+                 f"{doc_status()}")
+        except ValueError as exc:
+            log.warning("Edit rejected (source=%s): %s", source, exc)
+            send(recipient, f"❌ Edit failed: {exc}")
+        except (TimeoutError, requests.Timeout) as exc:
+            log.warning("Edit timed out (source=%s): %s", source, exc)
+            send(recipient,
+                 f"⏱️ Edit timed out after {LLM_TIMEOUT}s — the model may be "
+                 f"overloaded or the request is too large. Try a simpler instruction.")
         except Exception as exc:
-            log.error("ai_edit_doc failed: %s", exc)
-            send(recipient, "❌ Edit failed. Please try again.")
+            # The OpenAI client raises its own APITimeoutError; catch by name.
+            if "Timeout" in type(exc).__name__:
+                log.warning("Edit timed out (source=%s): %s", source, exc)
+                send(recipient,
+                     f"⏱️ Edit timed out after {LLM_TIMEOUT}s — the model may be "
+                     f"overloaded or the request is too large. Try a simpler instruction.")
+            else:
+                log.error("ai_edit_doc failed: %s", exc)
+                send(recipient, "❌ Edit failed. Please try again.")
+        finally:
+            nudge.cancel()
 
     else:
         send(recipient, DOC_HELP)
@@ -543,12 +648,25 @@ def handle_mention(recipient: str, query: str):
         send(recipient, f"👋 Ask me anything: `@{BOT_NAME} <your question>`")
         return
     send(recipient, "🔍 Looking that up…")
+    nudge = threading.Timer(
+        PROGRESS_NUDGE_SECONDS,
+        lambda: send(recipient,
+                     f"⏳ Still thinking… replies can take up to {LLM_TIMEOUT}s."),
+    )
+    nudge.start()
     try:
         answer = ai_search(query)
         send(recipient, answer or "🤷 I couldn't find a good answer.")
+    except TimeoutError as exc:
+        log.warning("Search timed out: %s", exc)
+        send(recipient,
+             f"⏱️ Reply timed out after {LLM_TIMEOUT}s — model may be overloaded "
+             f"or the question is too complex.")
     except Exception as exc:
         log.error("ai_search failed: %s", exc)
         send(recipient, "❌ Search failed. Please try again.")
+    finally:
+        nudge.cancel()
 
 
 ADMINS_HELP = (
