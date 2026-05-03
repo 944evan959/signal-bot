@@ -266,6 +266,8 @@ What's hardened:
 - **Group approval is explicit** — `/group claim` from the owner is required before the bot responds in any group; no implicit auto-onboarding.
 - **Search is off by default** — fully local. The `ddgs` package isn't even installed unless you uncomment it.
 
+Third-party image CVEs from `signal-cli-rest-api` are tracked separately. See [CVE-ASSESSMENT.md](CVE-ASSESSMENT.md) for the latest scan results, why none of the findings affect this deployment, and the re-scan schedule.
+
 What's intentionally not hardened:
 
 - Documents are stored unencrypted on disk. If the host filesystem is compromised, so is your data.

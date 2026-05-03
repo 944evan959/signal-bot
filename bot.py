@@ -88,6 +88,11 @@ LLM_TIMEOUT         = int(os.environ.get("LLM_TIMEOUT",   "180"))
 # seconds. Set to 0 to disable.
 PROGRESS_NUDGE_SECONDS = int(os.environ.get("PROGRESS_NUDGE_SECONDS", "30"))
 
+# Healthcheck marker. The bot touches this file on every WS event; the
+# Docker HEALTHCHECK greps its mtime to detect a wedged connection. Stored
+# under /tmp because the container's rootfs is read-only.
+HEALTH_FILE = Path(os.environ.get("HEALTH_FILE", "/tmp/signal-bot-healthy"))
+
 # Per-sender rate limit. Owner is exempt; everyone else gets at most
 # RATE_LIMIT_MAX messages in any RATE_LIMIT_WINDOW-second sliding window.
 # Set RATE_LIMIT_MAX=0 to disable.
@@ -1139,6 +1144,24 @@ def _extract_envelope(frame: dict) -> dict | None:
     return None
 
 
+def _mark_healthy() -> None:
+    """Touch HEALTH_FILE. Docker HEALTHCHECK reads its mtime to detect
+    wedged states: any mtime newer than ~90s past means a frame arrived
+    recently OR the WS just connected, so the bot is healthy."""
+    try:
+        HEALTH_FILE.touch()
+    except Exception as exc:
+        log.debug("Could not update health marker: %s", exc)
+
+
+def _mark_unhealthy() -> None:
+    """Remove the marker so HEALTHCHECK fails fast on disconnect."""
+    try:
+        HEALTH_FILE.unlink(missing_ok=True)
+    except Exception as exc:
+        log.debug("Could not clear health marker: %s", exc)
+
+
 def receive_loop():
     """
     Subscribe to signal-api's json-rpc websocket and dispatch each inbound
@@ -1156,12 +1179,18 @@ def receive_loop():
             log.info("WS connecting to %s", ws_url)
             ws = websocket.create_connection(ws_url, timeout=30)
             log.info("WS connected — waiting for messages")
+            _mark_healthy()
             backoff = 2  # reset on successful connect
 
             while True:
                 raw = ws.recv()
                 if not raw:
                     break
+
+                # Refresh the healthcheck marker. Each frame received = the
+                # connection is alive. The mtime check in HEALTHCHECK uses
+                # this to detect a wedged WS that hasn't disconnected cleanly.
+                _mark_healthy()
 
                 try:
                     frame = json.loads(raw)
@@ -1188,8 +1217,10 @@ def receive_loop():
 
         except websocket.WebSocketException as exc:
             log.warning("WS disconnected (%s) — reconnecting in %ds", exc, backoff)
+            _mark_unhealthy()
         except Exception as exc:
             log.error("WS unexpected error (%s) — reconnecting in %ds", exc, backoff)
+            _mark_unhealthy()
 
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)

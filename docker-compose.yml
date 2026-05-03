@@ -2,7 +2,9 @@ services:
 
   # ── Signal REST API ──────────────────────────────────────────────────────────
   signal-api:
-    image: bbernhard/signal-cli-rest-api:0.99
+    # Pinned by digest. To update: `docker pull bbernhard/signal-cli-rest-api:0.99`
+    # then `docker inspect --format='{{index .RepoDigests 0}}' bbernhard/signal-cli-rest-api:0.99`
+    image: bbernhard/signal-cli-rest-api:0.99@sha256:419d08b18db00ecabd30386765662330fda85bdacc7c302f0cd541244895aeb5
     container_name: signal-api
     restart: unless-stopped
     environment:
@@ -19,6 +21,11 @@ services:
       - ./signal-config:/home/.local/share/signal-cli
     networks:
       - internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   # ── Bot ───────────────────────────────────────────────────────────────────────
   bot:
@@ -70,6 +77,11 @@ services:
         limits:
           cpus: '2.0'
           memory: 1G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 secrets:
   bot_number:

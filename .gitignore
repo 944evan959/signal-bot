@@ -32,3 +32,16 @@ venv/
 
 .DS_Store
 Thumbs.db
+
+# ── Local notes ───────────────────────────────────────────────────────────────
+
+# Personal hardening checklist for whoever deploys this. Lives alongside the
+# repo so it's easy to find but not part of public history.
+SECURITY-TODO.md
+
+# Raw `docker scout cves` output. The published summary lives in
+# CVE-ASSESSMENT.md; the verbose scanner output is per-machine / per-arch
+# and not useful as version-controlled history.
+cve_assessment.txt
+*.scout.txt
+rootless_cves.txt
