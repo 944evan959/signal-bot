@@ -4,7 +4,9 @@ Signal Ollama Bot
 ─────────────────
 Sits in a Signal group chat and responds to:
   /doc [view|status|share|edit <instruction>]  — document management
-  @<BOT_NAME> <question>                        — AI-powered Q&A
+  @<bot> <question>                             — AI-powered Q&A
+                                                  (native Signal mention,
+                                                   resolved by BOT_UUID)
 
 Inbound messages arrive via signal-cli-rest-api's json-rpc websocket
 (/v1/receive), so message delivery is push-based with no polling overhead.
@@ -17,10 +19,13 @@ Web search modes (SEARCH_FALLBACK):
   auto         — keyword heuristic on the query: search only when timely
 
 Security model:
-  - Only responds inside the allowlisted group (or DMs from OWNER_ID)
-  - ADMIN_IDS can use write commands (/doc edit)
+  - Only responds in approved groups (claimed via /group claim by the owner)
+    or DMs from OWNER_ID
+  - Owner is admin everywhere
+  - Other admins are derived per-group from Signal's group-admin list,
+    cached only on `/admins update` — never automatic, never cross-group
   - All group members can use read commands + @mention
-  - Unlisted groups are silently ignored
+  - Unapproved groups are silently ignored
   - Instruction length is capped to prevent prompt injection
   - Message content is never written to logs
 """
@@ -57,11 +62,13 @@ log = logging.getLogger(__name__)
 
 SIGNAL_SERVICE   = os.environ.get("SIGNAL_SERVICE", "http://localhost:8080")
 BOT_NUMBER       = os.environ["BOT_NUMBER"]
-BOT_NAME         = os.environ.get("BOT_NAME", "Claude")
 DOC_DIR          = Path(os.environ.get("DOC_DIR", "docs"))
 PERSONA_PATH     = Path(os.environ.get("PERSONA_PATH", "persona.md"))
 GROUPS_FILE      = Path(os.environ.get("GROUPS_FILE", "groups.txt"))
-ADMINS_FILE      = Path(os.environ.get("ADMINS_FILE", "admins.txt"))
+# Per-group cached Signal admin lists. Populated only on `/admins update`,
+# never automatically — explicit refresh keeps Signal-side admin changes
+# from silently granting bot-admin privileges. Per-group, never global.
+GROUP_ADMINS_FILE = Path(os.environ.get("GROUP_ADMINS_FILE", "group_admins.json"))
 MAX_INLINE_CHARS    = int(os.environ.get("MAX_INLINE_CHARS",    "1500"))
 MAX_INSTRUCTION     = int(os.environ.get("MAX_INSTRUCTION",     "500"))
 MAX_QUERY_CHARS     = int(os.environ.get("MAX_QUERY_CHARS",     "1000"))
@@ -99,19 +106,16 @@ HEALTH_FILE = Path(os.environ.get("HEALTH_FILE", "/tmp/signal-bot-healthy"))
 RATE_LIMIT_MAX    = int(os.environ.get("RATE_LIMIT_MAX",    "10"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
 
-ALLOWED_GROUP : str      = os.environ.get("ALLOWED_GROUP", "").strip()
-ADMIN_IDS     : set[str] = {
-    n.strip() for n in os.environ.get("ADMIN_IDS", "").split(",") if n.strip()
-}
 # OWNER_ID — the single number or UUID that can DM the bot directly.
-# Accepts phone number (+15551234567) or UUID, same as ADMIN_IDS.
+# The owner is implicitly admin in every approved group as well.
 OWNER_ID      : str      = os.environ.get("OWNER_ID", "").strip()
 
-# BOT_UUID — the bot's own Signal UUID. When set, the bot responds to native
-# Signal @mentions of itself (selected via the in-app contact picker). When
-# unset, the bot falls back to text-matching `@<BOT_NAME>` and logs the
-# author of any structured mentions it sees so the user can discover the
-# right value.
+# BOT_UUID — the bot's own Signal UUID. Required for the bot to respond to
+# @mentions in groups. When unset, the bot still logs the authors of any
+# structured mentions it sees (so you can discover the UUID by sending a
+# message that @-mentions the bot, then reading the log line:
+#   Mentions in message: ['<bot-uuid>']
+# Copy that into BOT_UUID and force-recreate.
 BOT_UUID      : str      = os.environ.get("BOT_UUID", "").strip()
 
 
@@ -132,32 +136,34 @@ EDIT_SYSTEM_PROMPT = (
 
 def _starter_persona() -> str:
     return (
-        f"You are {BOT_NAME}, an AI assistant in a Signal group chat.\n"
-        f"\n"
-        f"# Identity\n"
-        f"- When asked who you are, identify yourself as {BOT_NAME}.\n"
-        f"- Do NOT mention being trained by Google, Meta, OpenAI, Anthropic, "
-        f"or any other company. You are simply {BOT_NAME}.\n"
-        f"- Keep answers concise — under 300 words — since this is a group chat.\n"
-        f"- Reply in plain prose. Avoid markdown formatting (headers, bold "
-        f"asterisks, bullet lists, code fences) unless explicitly asked.\n"
-        f"\n"
-        f"# Tone\n"
-        f"- Be direct and helpful. Skip filler phrases like \"Great question!\".\n"
-        f"- If you don't know something, say so plainly instead of guessing.\n"
-        f"\n"
-        f"# Context\n"
-        f"Edit this section to teach the bot about the people, places, and\n"
-        f"running threads in this chat. Everything below is included as system\n"
-        f"context for every Q&A reply, so the bot can resolve references like\n"
-        f"\"my brother\", \"the cabin\", or \"that project we discussed\".\n"
-        f"\n"
-        f"Useful things to put here:\n"
-        f"- Group purpose (family chat, work team, friend group, etc.)\n"
-        f"- Members and their roles or relationships to each other\n"
-        f"- Aliases / nicknames the model wouldn't otherwise know\n"
-        f"- Recurring topics, projects, or in-jokes worth recognising\n"
-        f"- Locations, pets, or anything else commonly referred to by shorthand\n"
+        "You are an AI assistant in a Signal group chat.\n"
+        "\n"
+        "# Identity\n"
+        "- Edit this section to give yourself a name. The name in your Signal\n"
+        "  profile is what users see when they @-mention you, but you can\n"
+        "  introduce yourself as anything in conversation.\n"
+        "- Do NOT mention being trained by Google, Meta, OpenAI, Anthropic,\n"
+        "  or any other company. Identify only as the name set above.\n"
+        "- Keep answers concise — under 300 words — since this is a group chat.\n"
+        "- Reply in plain prose. Avoid markdown formatting (headers, bold\n"
+        "  asterisks, bullet lists, code fences) unless explicitly asked.\n"
+        "\n"
+        "# Tone\n"
+        "- Be direct and helpful. Skip filler phrases like \"Great question!\".\n"
+        "- If you don't know something, say so plainly instead of guessing.\n"
+        "\n"
+        "# Context\n"
+        "Edit this section to teach the bot about the people, places, and\n"
+        "running threads in this chat. Everything below is included as system\n"
+        "context for every Q&A reply, so the bot can resolve references like\n"
+        "\"my brother\", \"the cabin\", or \"that project we discussed\".\n"
+        "\n"
+        "Useful things to put here:\n"
+        "- Group purpose (family chat, work team, friend group, etc.)\n"
+        "- Members and their roles or relationships to each other\n"
+        "- Aliases / nicknames the model wouldn't otherwise know\n"
+        "- Recurring topics, projects, or in-jokes worth recognising\n"
+        "- Locations, pets, or anything else commonly referred to by shorthand\n"
     )
 
 
@@ -404,49 +410,64 @@ def _remove_known_group(group_id: str) -> bool:
 def is_allowed_group(group_id: str | None) -> bool:
     if not group_id:
         return False
-    if ALLOWED_GROUP and group_id == ALLOWED_GROUP:
-        return True
     return group_id in _load_known_groups()
 
-def _load_file_admins() -> set[str]:
-    """Read the runtime-managed admin set from ADMINS_FILE."""
-    if not ADMINS_FILE.exists():
+def _load_group_admins_map() -> dict:
+    """Read the persisted {group_key: [admin_id, ...]} map."""
+    if not GROUP_ADMINS_FILE.exists():
+        return {}
+    try:
+        return json.loads(GROUP_ADMINS_FILE.read_text())
+    except json.JSONDecodeError:
+        log.warning("Could not parse %s; treating as empty", GROUP_ADMINS_FILE)
+        return {}
+
+
+def _save_group_admins_map(m: dict) -> None:
+    GROUP_ADMINS_FILE.write_text(json.dumps(m, indent=2, sort_keys=True))
+
+
+def _group_admins_for(group_key: str | None) -> set[str]:
+    """Cached Signal-group admins for the given group_key, or empty for DM /
+    unknown groups. Refreshed only by the `/admins update` command."""
+    if not group_key:
         return set()
-    return {ln.strip() for ln in ADMINS_FILE.read_text().splitlines() if ln.strip()}
+    return set(_load_group_admins_map().get(group_key, []))
 
 
-def _save_file_admin(admin_id: str) -> bool:
-    """Add admin_id to ADMINS_FILE. Returns True if added, False if already present."""
-    ids = _load_file_admins()
-    if admin_id in ids:
-        return False
-    ids.add(admin_id)
-    ADMINS_FILE.write_text("\n".join(sorted(ids)) + "\n")
-    return True
+def refresh_group_admins(group_key: str, group_id: str) -> tuple[set[str], set[str]]:
+    """Pull the current Signal admin list for `group_id` from signal-api and
+    persist it under `group_key`. Returns (added, removed) versus the previously
+    cached list. Raises on any failure."""
+    r = requests.get(f"{SIGNAL_SERVICE}/v1/groups/{BOT_NUMBER}", timeout=5)
+    r.raise_for_status()
+    new_admins: set[str] = set()
+    found = False
+    for g in r.json():
+        if g.get("internal_id") == group_id:
+            new_admins = set(g.get("admins") or [])
+            found = True
+            break
+    if not found:
+        raise ValueError(f"signal-api doesn't see this bot in group {group_id[:20]}…")
+
+    m = _load_group_admins_map()
+    old_admins = set(m.get(group_key, []))
+    m[group_key] = sorted(new_admins)
+    _save_group_admins_map(m)
+    return (new_admins - old_admins, old_admins - new_admins)
 
 
-def _remove_file_admin(admin_id: str) -> bool:
-    """Remove admin_id from ADMINS_FILE. Returns True if removed, False if absent."""
-    ids = _load_file_admins()
-    if admin_id not in ids:
-        return False
-    ids.discard(admin_id)
-    ADMINS_FILE.write_text(("\n".join(sorted(ids)) + "\n") if ids else "")
-    return True
+def is_admin(source: str, source_uuid: str, group_key: str | None = None) -> bool:
+    """Admin = owner (always), or Signal-recognized admin of THIS specific
+    group (cached via /admins update). Per-group only — privilege never
+    extends to other groups or DMs.
 
-
-def _all_admins() -> set[str]:
-    """Combined admin set: env-configured plus file-persisted."""
-    return ADMIN_IDS | _load_file_admins()
-
-
-def is_admin(source: str, source_uuid: str) -> bool:
-    """Checks phone number OR UUID so username-only Signal users are supported."""
-    ids = _all_admins()
-    if not ids:
-        log.warning("No admins configured — all write commands disabled.")
-        return False
-    return bool(ids & {source, source_uuid})
+    Phone number OR UUID match, so username-only Signal users are supported.
+    """
+    if is_owner(source, source_uuid):
+        return True
+    return bool(_group_admins_for(group_key) & {source, source_uuid})
 
 
 def is_owner(source: str, source_uuid: str) -> bool:
@@ -701,7 +722,7 @@ def _doc_view(recipient: str, group_key: str, name: str,
         return
     if len(content) > MAX_INLINE_CHARS:
         hint = ("use `/doc share` for the full file"
-                if is_admin(source, source_uuid)
+                if is_admin(source, source_uuid, group_key)
                 else "ask an admin for the full file")
         send(recipient, content[:MAX_INLINE_CHARS] + f"\n\n…*(truncated — {hint})*")
     else:
@@ -738,7 +759,7 @@ def _doc_list(recipient: str, group_key: str):
 
 def _doc_create(recipient: str, group_key: str, name: str,
                 source: str, source_uuid: str):
-    if not is_admin(source, source_uuid):
+    if not is_admin(source, source_uuid, group_key):
         send(recipient, "🔒 Only admins can create documents.")
         return
     if not is_valid_doc_name(name):
@@ -758,7 +779,7 @@ def _doc_create(recipient: str, group_key: str, name: str,
 
 def _doc_delete(recipient: str, group_key: str, name: str,
                 source: str, source_uuid: str):
-    if not is_admin(source, source_uuid):
+    if not is_admin(source, source_uuid, group_key):
         send(recipient, "🔒 Only admins can delete documents.")
         return
     if name == DEFAULT_DOC_NAME:
@@ -774,7 +795,7 @@ def _doc_delete(recipient: str, group_key: str, name: str,
 
 def _doc_edit(recipient: str, group_key: str, name: str, raw_instruction: str,
               source: str, source_uuid: str):
-    if not is_admin(source, source_uuid):
+    if not is_admin(source, source_uuid, group_key):
         send(recipient, "🔒 Only admins can edit documents.")
         log.info("Write denied source=%s uuid=%s", source, source_uuid)
         return
@@ -910,7 +931,7 @@ def _dispatch_doc_verb(recipient: str, group_key: str, name: str, verb: str,
     elif verb == "status":
         _doc_status(recipient, group_key, name)
     elif verb == "share":
-        if not is_admin(source, source_uuid):
+        if not is_admin(source, source_uuid, group_key):
             send(recipient, "🔒 Only admins can share the document as a file.")
             log.info("Share denied source=%s uuid=%s", source, source_uuid)
             return
@@ -923,7 +944,7 @@ def _dispatch_doc_verb(recipient: str, group_key: str, name: str, verb: str,
 
 def handle_mention(recipient: str, query: str):
     if not query:
-        send(recipient, f"👋 Ask me anything: `@{BOT_NAME} <your question>`")
+        send(recipient, "👋 @-mention me with your question to ask anything.")
         return
     send(recipient, "🔍 Looking that up…")
     nudge = threading.Timer(
@@ -949,76 +970,66 @@ def handle_mention(recipient: str, query: str):
 
 ADMINS_HELP = (
     "👥 *Admin commands:*\n"
-    "`/admins`              — list owner and admins\n"
-    "`/admins add <id>`     — add an admin *(owner only)*\n"
-    "`/admins remove <id>`  — remove a runtime-added admin *(owner only)*\n\n"
-    "Use phone numbers (`+15551234567`) or UUIDs. Admins added via `.env`\n"
-    "are pinned and can't be removed at runtime — edit `.env` instead."
+    "`/admins`              — list owner and this group's admins\n"
+    "`/admins update`       — refresh this group's admin cache from Signal *(owner only, group only)*\n\n"
+    "Bot admins are derived from Signal's group-admin list, scoped per-group.\n"
+    "The owner is implicitly admin in every approved group, but no one else's\n"
+    "admin status carries between groups."
 )
 
 
-def _list_admins(recipient: str):
-    file_ids = _load_file_admins()
-    all_ids  = ADMIN_IDS | file_ids
+def _list_admins(recipient: str, group_key: str | None):
+    group_ids = _group_admins_for(group_key)
 
     lines = []
     lines.append(f"👑 *Owner:* `{OWNER_ID}`" if OWNER_ID else "👑 *Owner:* _not set_")
 
-    if all_ids:
-        lines.append(f"\n👥 *Admins ({len(all_ids)}):*")
-        for aid in sorted(all_ids):
-            origin = "env" if aid in ADMIN_IDS else "file"
-            lines.append(f"• `{aid}` _({origin})_")
+    if group_ids:
+        lines.append(f"\n👥 *Group admins ({len(group_ids)}):*")
+        for aid in sorted(group_ids):
+            lines.append(f"• `{aid}`")
+    elif group_key:
+        lines.append("\n_No group admins cached for this chat. "
+                     "Run `/admins update` to fetch from Signal._")
     else:
-        lines.append("\n👥 *Admins:* _none configured_")
+        # DM context — no group concept. Owner is the only admin here anyway.
+        lines.append("\n_(In DMs, the owner is the only admin.)_")
 
     send(recipient, "\n".join(lines))
 
 
-def handle_admins(recipient: str, args: str, source: str, source_uuid: str):
+def handle_admins(recipient: str, args: str, source: str, source_uuid: str,
+                  group_key: str | None, group_id: str | None):
     args = args.strip()
 
     if args in ("", "list"):
-        _list_admins(recipient)
+        _list_admins(recipient, group_key)
         return
 
-    # Add / remove are owner-only
-    if args.startswith("add ") or args.startswith("remove ") or args.startswith("rm "):
+    if args == "update":
+        if not group_id:
+            send(recipient, "⚠️ `/admins update` only works in a group chat.")
+            return
         if not is_owner(source, source_uuid):
-            send(recipient, "🔒 Only the owner can modify the admin list.")
-            log.info("Admin-mutation denied source=%s uuid=%s", source, source_uuid)
+            send(recipient, "🔒 Only the owner can refresh the group admin list.")
+            log.info("Group-admin refresh denied source=%s", source)
             return
-
-    if args.startswith("add "):
-        admin_id = args[4:].strip()
-        if not admin_id or " " in admin_id or len(admin_id) > 128:
-            send(recipient, "⚠️ Usage: `/admins add <phone-or-uuid>`")
+        try:
+            added, removed = refresh_group_admins(group_key, group_id)
+        except Exception as exc:
+            log.warning("Group-admin refresh failed: %s", exc)
+            send(recipient, f"❌ Refresh failed: {exc}")
             return
-        if admin_id in ADMIN_IDS:
-            send(recipient, f"⚠️ `{admin_id}` is already configured via `.env`.")
-            return
-        if _save_file_admin(admin_id):
-            log.info("Admin added: %s by owner=%s", admin_id, source)
-            send(recipient, f"✅ Added admin: `{admin_id}`")
-        else:
-            send(recipient, f"⚠️ `{admin_id}` is already an admin.")
-        return
-
-    if args.startswith("remove ") or args.startswith("rm "):
-        admin_id = args.split(maxsplit=1)[1].strip() if " " in args else ""
-        if not admin_id:
-            send(recipient, "⚠️ Usage: `/admins remove <phone-or-uuid>`")
-            return
-        if admin_id in ADMIN_IDS and admin_id not in _load_file_admins():
-            send(recipient,
-                 f"⚠️ `{admin_id}` is configured via `.env`. Remove it from "
-                 f"`.env` and force-recreate the container instead.")
-            return
-        if _remove_file_admin(admin_id):
-            log.info("Admin removed: %s by owner=%s", admin_id, source)
-            send(recipient, f"✅ Removed admin: `{admin_id}`")
-        else:
-            send(recipient, f"⚠️ `{admin_id}` is not in the admin list.")
+        log.info("Group admins refreshed for %s: +%d -%d by owner=%s",
+                 group_key, len(added), len(removed), source)
+        bullets = []
+        if added:
+            bullets.append("Added: " + ", ".join(f"`{a}`" for a in sorted(added)))
+        if removed:
+            bullets.append("Removed: " + ", ".join(f"`{a}`" for a in sorted(removed)))
+        if not bullets:
+            bullets.append("No changes.")
+        send(recipient, "✅ Group admin cache refreshed.\n\n" + "\n".join(bullets))
         return
 
     send(recipient, ADMINS_HELP)
@@ -1055,7 +1066,8 @@ def route(envelope: dict):
             handle_doc(recipient, text[4:], source, source_uuid,
                        _group_key(None, is_dm=True))
         elif text.strip().startswith("/admins"):
-            handle_admins(recipient, text.strip()[7:], source, source_uuid)
+            handle_admins(recipient, text.strip()[7:], source, source_uuid,
+                          group_key=None, group_id=None)
         else:
             # In DMs every message is treated as a search query — no @mention needed
             handle_mention(recipient, sanitize_query(text))
@@ -1083,11 +1095,14 @@ def route(envelope: dict):
         send(recipient, "👋 Group released. I'll stop responding here.")
         return
 
-    # /admins — list / add / remove. Read is admin-or-owner; mutations are
-    # checked inside handle_admins (owner only).
+    group_key = _group_key(group_id, is_dm=False)
+
+    # /admins — list / add / remove / update. Read is admin-or-owner;
+    # mutations are checked inside handle_admins (owner only).
     if text.strip().startswith("/admins"):
-        if is_owner(source, source_uuid) or is_admin(source, source_uuid):
-            handle_admins(recipient, text.strip()[7:], source, source_uuid)
+        if is_owner(source, source_uuid) or is_admin(source, source_uuid, group_key):
+            handle_admins(recipient, text.strip()[7:], source, source_uuid,
+                          group_key=group_key, group_id=group_id)
         else:
             send(recipient, "🔒 Only admins can use the admins command.")
         return
@@ -1106,21 +1121,21 @@ def route(envelope: dict):
 
     if text.startswith("/doc"):
         cmd = "doc"
-    elif bot_mentioned or f"@{BOT_NAME}" in text:
+    elif bot_mentioned:
         cmd = "mention"
     else:
         return
 
     log.info("CMD=%s source=%s uuid=%s admin=%s",
-             cmd, source, source_uuid, is_admin(source, source_uuid))
+             cmd, source, source_uuid, is_admin(source, source_uuid, group_key))
 
     if cmd == "doc":
-        handle_doc(recipient, text[4:], source, source_uuid,
-                   _group_key(group_id, is_dm=False))
+        handle_doc(recipient, text[4:], source, source_uuid, group_key)
     elif cmd == "mention":
-        # Strip both the structured-mention placeholder (￼) and the
-        # legacy @<BOT_NAME> text trigger, then sanitize before LLM input.
-        cleaned = text.replace("￼", "").replace(f"@{BOT_NAME}", "").strip()
+        # Strip the structured-mention placeholder (￼), then sanitize before
+        # LLM input. Native Signal mentions don't include the bot's name as
+        # text — the placeholder is the only artifact.
+        cleaned = text.replace("￼", "").strip()
         handle_mention(recipient, sanitize_query(cleaned))
 
 
@@ -1231,8 +1246,6 @@ def main():
     log.info("AI         : %s", _ai_description())
     log.info("Number     : %s", BOT_NUMBER)
     known = _load_known_groups()
-    if ALLOWED_GROUP:
-        known.add(ALLOWED_GROUP)
     if known:
         log.info("Groups     : %d known (%s)", len(known),
                  ", ".join(sorted(known)[:3]) + ("…" if len(known) > 3 else ""))
@@ -1240,10 +1253,14 @@ def main():
         log.info("Groups     : none yet — owner can run `/group claim` in a group to approve it")
     else:
         log.warning("Groups     : none, and OWNER_ID not set — bot will reject all groups")
-    log.info("Admins     : %d configured", len(ADMIN_IDS))
+    cached_groups = _load_group_admins_map()
+    cached_admins = sum(len(v) for v in cached_groups.values())
+    log.info("Admins     : %d cached across %d group(s); owner=%s",
+             cached_admins, len(cached_groups),
+             "set" if OWNER_ID else "UNSET")
 
-    if not ADMIN_IDS:
-        log.warning("Set ADMIN_IDS in .env to enable /doc edit.")
+    if not OWNER_ID:
+        log.warning("OWNER_ID not set — no one can DM the bot or run admin commands.")
 
     if _SEARCH_MODE in ("auto", "duckduckgo"):
         try:

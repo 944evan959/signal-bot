@@ -36,9 +36,6 @@ services:
       - signal-api
     environment:
       - SIGNAL_SERVICE=http://signal-api:8080
-      - BOT_NAME=${BOT_NAME:-Claude}
-      - ALLOWED_GROUP=${ALLOWED_GROUP}
-      - ADMIN_IDS=${ADMIN_IDS}
       - OWNER_ID=${OWNER_ID}
       - BOT_UUID=${BOT_UUID}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
@@ -48,7 +45,7 @@ services:
       - DOC_DIR=/data/docs
       - PERSONA_PATH=/data/persona.md
       - GROUPS_FILE=/data/groups.txt
-      - ADMINS_FILE=/data/admins.txt
+      - GROUP_ADMINS_FILE=/data/group_admins.json
       - MAX_QUERY_CHARS=${MAX_QUERY_CHARS-1000}
       - MAX_DOC_CHARS=${MAX_DOC_CHARS-50000}
       - MAX_DOC_INPUT_CHARS=${MAX_DOC_INPUT_CHARS-20000}
