@@ -24,9 +24,8 @@ Each chat (group or DM) has its own independent document set, and admins can kee
 | `/doc <name> <verb>` *(view/status/share/edit/delete)* | Group + DM | Per-verb (admin for write/share) | Operate on named doc |
 | `/group claim` | Group only | Owner | Approves the current group for bot use |
 | `/group leave` | Group only | Owner | Removes the current group from approved set |
-| `/admins` | Group + DM | Admins (group) / owner (DM) | List the configured owner and admin IDs |
-| `/admins add <id>` | Group + DM | Owner | Add an admin at runtime (persisted to `data/admins.txt`) |
-| `/admins remove <id>` | Group + DM | Owner | Remove a runtime-added admin (env-based admins are pinned) |
+| `/admins` | Group + DM | Admins (group) / owner (DM) | List the owner and this group's admins |
+| `/admins update` | Group only | Owner | Refresh the group's admin cache from Signal. Signal-side admins of *this* group become bot-admins for commands run *in this group only* — no automatic refresh, no spillover into other groups or DMs |
 | `@bot <question>` *(native Signal mention or text)* | Group only | Everyone | Answers any question |
 | *(any text)* | DM only | Owner | Treated as an `@<BOT_NAME>` query |
 
@@ -132,7 +131,7 @@ DM source=<your-id>
 
 Copy `<your-id>` into `OWNER_ID` in `.env`. That's either your phone number or your UUID, whichever signal-cli has for you.
 
-**Find your admin IDs:** if you want others to use `/doc edit` in the group, add their identifiers to `ADMIN_IDS` the same way. (You can leave this empty initially and just use yourself.)
+**Adding more admins** is a per-group action — make them admins in Signal's own group settings, then run `/admins update` in that group. Their bot-admin status is scoped to that group only. (See [Configuration knobs](#configuration-knobs) and the [admins commands](#what-it-does) above.)
 
 **Find the bot's own UUID** *(optional, for native @mentions)*: in the group, type `@` and select the bot from Signal's contact picker, then send. The bot logs:
 
@@ -272,7 +271,7 @@ What's intentionally not hardened:
 
 - Documents are stored unencrypted on disk. If the host filesystem is compromised, so is your data.
 - `/doc` (view) is open to all group members of an approved group. Don't put data in there that isn't appropriate for everyone in the group to see.
-- Admins are trusted with whatever they can write into a doc via `/doc edit`. The trust boundary is the admin set.
+- Admins are trusted with whatever they can write into a doc via `/doc edit`. The trust boundary is per-group: a Signal-recognized admin in Group A only has bot-admin power in Group A. Demoting them on Signal's side and running `/admins update` in that group revokes it.
 
 ---
 
@@ -284,7 +283,7 @@ What's intentionally not hardened:
 
 **`send() HTTP 400 ... "Invalid identifier"`** — the bot's group recipient construction is wrong. The wrapper expects `group.<base64(internal_id)>`; this is handled automatically, but if you've modified the routing code, check [bot.py](bot.py)'s `route()` function.
 
-**Bot replies in group don't reach you, but DMs work**, or you can't be added to the group via your phone number — your Signal account has **"Find by Phone Number"** disabled. The bot must address you by username or UUID instead. Use your UUID (visible in any envelope's `sourceUuid` or `source`) for `OWNER_ID` and `ADMIN_IDS`. Bot-to-non-findable-user sends require the username, e.g. `recipients=["yourname.42"]`.
+**Bot replies in group don't reach you, but DMs work**, or you can't be added to the group via your phone number — your Signal account has **"Find by Phone Number"** disabled. The bot must address you by username or UUID instead. Use your UUID (visible in any envelope's `sourceUuid` or `source`) for `OWNER_ID`. Bot-to-non-findable-user sends require the username, e.g. `recipients=["yourname.42"]`.
 
 **`@Claude hello` in the group produces no log line** — `BOT_NAME` defaults to `Claude`. Either use that name, or set `BOT_NAME=somethingelse` in `.env` and restart. (Or set `BOT_UUID` and use Signal's native @mention picker, which doesn't depend on `BOT_NAME` at all.)
 
@@ -307,7 +306,7 @@ signal-ollama-bot/
 ├── data/
 │   ├── persona.md          # bot identity + relational context (auto-created)
 │   ├── groups.txt          # claimed group IDs (managed via /group claim)
-│   ├── admins.txt          # runtime-added admins (managed via /admins add)
+│   ├── group_admins.json   # per-group Signal admin cache (managed via /admins update)
 │   └── docs/               # per-chat document namespaces
 │       ├── dm/             # owner-DM documents
 │       │   ├── default.md
