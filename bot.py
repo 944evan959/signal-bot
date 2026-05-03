@@ -130,6 +130,8 @@ def _starter_persona() -> str:
         f"- Do NOT mention being trained by Google, Meta, OpenAI, Anthropic, "
         f"or any other company. You are simply {BOT_NAME}.\n"
         f"- Keep answers concise — under 300 words — since this is a group chat.\n"
+        f"- Reply in plain prose. Avoid markdown formatting (headers, bold "
+        f"asterisks, bullet lists, code fences) unless explicitly asked.\n"
         f"\n"
         f"# Tone\n"
         f"- Be direct and helpful. Skip filler phrases like \"Great question!\".\n"
@@ -306,7 +308,7 @@ def _answer(query: str, ddg_context: str = "") -> str:
             {"role": "user",   "content": user_content},
         ],
     )
-    return response.choices[0].message.content.strip()
+    return strip_markdown(response.choices[0].message.content.strip())
 
 
 def ai_search(query: str) -> str:
@@ -332,7 +334,7 @@ def ai_search(query: str) -> str:
 
     answer = _answer(query)
     if not _SEARCH_MODE:
-        answer += "\n\n_⚠️ No live search — answered from model training data._"
+        answer += "\n\n⚠️ No live search — answered from model training data."
     return answer
 
 
@@ -444,6 +446,45 @@ def sanitize_instruction(raw: str) -> str:
 
 def sanitize_query(raw: str) -> str:
     return _sanitize_user_text(raw, MAX_QUERY_CHARS)
+
+
+def strip_markdown(text: str) -> str:
+    """
+    Remove the most disruptive markdown formatting from chat replies.
+    Signal renders some markdown but the model output is often littered with
+    `# headers`, `**bold**`, fence blocks etc. that show as literal characters.
+
+    Handles:
+      - Code fences (``` ... ```) — keep the inner code, drop the markers
+      - Headers (#, ##, … at line start)
+      - Bold (**x**, __x__) and italic (*x*, _x_) markers — keep the text
+      - Inline links [text](url) → "text (url)"
+
+    Does NOT strip:
+      - Inline code (`x`) — renders fine and aids readability
+      - Bullet markers (- or *)
+      - Numbered list prefixes
+    """
+    # Code fences: drop the marker lines but keep the code block content
+    text = re.sub(r"```[A-Za-z0-9_-]*\n?", "", text)
+    text = text.replace("```", "")
+
+    # Headers at line start: # / ## / ### / etc.
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+
+    # Bold first (so the doubled-marker doesn't get half-eaten by the italic rule)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__",     r"\1", text, flags=re.DOTALL)
+
+    # Italic — only when wrapping non-whitespace content, to avoid stripping
+    # bullet `* ` markers and stray asterisks used for emphasis-by-spacing.
+    text = re.sub(r"(?<!\w)\*(\S(?:.*?\S)?)\*(?!\w)", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)_(\S(?:.*?\S)?)_(?!\w)",   r"\1", text, flags=re.DOTALL)
+
+    # Links: [text](url) → text (url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+
+    return text.strip()
 
 
 # Per-sender sliding-window rate limiter. Owner is exempt.

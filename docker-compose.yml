@@ -13,8 +13,8 @@ services:
     # For initial setup (register / verify), temporarily uncomment this,
     # then remove it again once registration is complete:
     #
-    ports:
-      - "127.0.0.1:8080:8080"   # loopback only — never 0.0.0.0
+    # ports:
+    #  - "127.0.0.1:8080:8080"   # loopback only — never 0.0.0.0
     volumes:
       - ./signal-config:/home/.local/share/signal-cli
     networks:
