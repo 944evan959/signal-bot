@@ -4,7 +4,9 @@ Signal Ollama Bot
 ─────────────────
 Sits in a Signal group chat and responds to:
   /doc [view|status|share|edit <instruction>]  — document management
-  @<BOT_NAME> <question>                        — AI-powered Q&A
+  @<bot> <question>                             — AI-powered Q&A
+                                                  (native Signal mention,
+                                                   resolved by BOT_UUID)
 
 Inbound messages arrive via signal-cli-rest-api's json-rpc websocket
 (/v1/receive), so message delivery is push-based with no polling overhead.
@@ -108,11 +110,12 @@ RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
 # The owner is implicitly admin in every approved group as well.
 OWNER_ID      : str      = os.environ.get("OWNER_ID", "").strip()
 
-# BOT_UUID — the bot's own Signal UUID. When set, the bot responds to native
-# Signal @mentions of itself (selected via the in-app contact picker). When
-# unset, the bot falls back to text-matching `@<BOT_NAME>` and logs the
-# author of any structured mentions it sees so the user can discover the
-# right value.
+# BOT_UUID — the bot's own Signal UUID. Required for the bot to respond to
+# @mentions in groups. When unset, the bot still logs the authors of any
+# structured mentions it sees (so you can discover the UUID by sending a
+# message that @-mentions the bot, then reading the log line:
+#   Mentions in message: ['<bot-uuid>']
+# Copy that into BOT_UUID and force-recreate.
 BOT_UUID      : str      = os.environ.get("BOT_UUID", "").strip()
 
 
@@ -941,7 +944,7 @@ def _dispatch_doc_verb(recipient: str, group_key: str, name: str, verb: str,
 
 def handle_mention(recipient: str, query: str):
     if not query:
-        send(recipient, f"👋 Ask me anything: `@{BOT_NAME} <your question>`")
+        send(recipient, "👋 @-mention me with your question to ask anything.")
         return
     send(recipient, "🔍 Looking that up…")
     nudge = threading.Timer(
@@ -1118,7 +1121,7 @@ def route(envelope: dict):
 
     if text.startswith("/doc"):
         cmd = "doc"
-    elif bot_mentioned or f"@{BOT_NAME}" in text:
+    elif bot_mentioned:
         cmd = "mention"
     else:
         return
@@ -1129,9 +1132,10 @@ def route(envelope: dict):
     if cmd == "doc":
         handle_doc(recipient, text[4:], source, source_uuid, group_key)
     elif cmd == "mention":
-        # Strip both the structured-mention placeholder (￼) and the
-        # legacy @<BOT_NAME> text trigger, then sanitize before LLM input.
-        cleaned = text.replace("￼", "").replace(f"@{BOT_NAME}", "").strip()
+        # Strip the structured-mention placeholder (￼), then sanitize before
+        # LLM input. Native Signal mentions don't include the bot's name as
+        # text — the placeholder is the only artifact.
+        cleaned = text.replace("￼", "").strip()
         handle_mention(recipient, sanitize_query(cleaned))
 
 

@@ -26,10 +26,10 @@ Each chat (group or DM) has its own independent document set, and admins can kee
 | `/group leave` | Group only | Owner | Removes the current group from approved set |
 | `/admins` | Group + DM | Admins (group) / owner (DM) | List the owner and this group's admins |
 | `/admins update` | Group only | Owner | Refresh the group's admin cache from Signal. Signal-side admins of *this* group become bot-admins for commands run *in this group only* — no automatic refresh, no spillover into other groups or DMs |
-| `@bot <question>` *(native Signal mention or text)* | Group only | Everyone | Answers any question |
-| *(any text)* | DM only | Owner | Treated as an `@<BOT_NAME>` query |
+| `@bot <question>` *(native Signal mention)* | Group only | Everyone | Answers any question |
+| *(any text)* | DM only | Owner | Treated as a question — no mention needed |
 
-In DMs from the owner, every message is a query — no `@` prefix needed. In the group, the bot responds when it's @mentioned (via Signal's native contact-picker mention) or when its `BOT_NAME` text trigger appears. The native mention works regardless of what users have nicknamed the bot.
+In DMs from the owner, every message is a query — no `@` prefix needed. In a group, the bot responds when it's @mentioned via Signal's native contact picker; the bot is identified by its UUID (`BOT_UUID`), independent of any nickname users have set.
 
 ---
 
@@ -133,13 +133,13 @@ Copy `<your-id>` into `OWNER_ID` in `.env`. That's either your phone number or y
 
 **Adding more admins** is a per-group action — make them admins in Signal's own group settings, then run `/admins update` in that group. Their bot-admin status is scoped to that group only. (See [Configuration knobs](#configuration-knobs) and the [admins commands](#what-it-does) above.)
 
-**Find the bot's own UUID** *(optional, for native @mentions)*: in the group, type `@` and select the bot from Signal's contact picker, then send. The bot logs:
+**Find the bot's own UUID** *(required for group @mentions)*: in the group, type `@` and select the bot from Signal's contact picker, then send. The bot logs:
 
 ```
 Mentions in message: ['<bot-uuid>']
 ```
 
-Copy that UUID into `BOT_UUID` in `.env`. Once set, group members can @mention the bot using Signal's native picker — no need to type `@Claude` or whatever `BOT_NAME` is set to. The text-based `@<BOT_NAME>` trigger continues to work as a fallback.
+Copy that UUID into `BOT_UUID` in `.env` and force-recreate the container. Once set, the bot responds to native @mentions of itself in any approved group. Without `BOT_UUID`, the bot won't respond to mentions at all — only `/doc` commands work.
 
 **Add to your group with explicit approval.** Once `OWNER_ID` is set:
 
@@ -165,7 +165,6 @@ docker compose logs -f bot
 Try one of:
 
 - **Group**: type `@` in your group chat, pick the bot from Signal's autocomplete, then send your question.
-- **Group fallback**: send `@<BOT_NAME> hello` as plain text (default `BOT_NAME` is `Claude`).
 - **DM**: if you set `OWNER_ID`, just DM the bot any question — no prefix needed.
 
 Reply should arrive within a few seconds.
@@ -174,7 +173,7 @@ Reply should arrive within a few seconds.
 
 ## Customisation
 
-**Mention name** — set `BOT_NAME=Bob` in `.env` and group members invoke `@Bob`. (No effect on DMs.)
+**Bot's display name** — set the Signal profile name on the bot's account (step 4 in setup). That's the name users see when @-mentioning. Internal matching uses `BOT_UUID`, so you can change the display name freely without touching `.env`.
 
 **Different models for edit vs query**:
 ```
@@ -234,7 +233,6 @@ All optional, all in `.env`. Defaults in [env.example](env.example).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BOT_NAME` | `Claude` | Text-trigger name (`@<BOT_NAME> question`); irrelevant if `BOT_UUID` is set |
 | `MAX_INLINE_CHARS` | `1500` | `/doc` view truncation point — beyond this, send via `/doc share` |
 | `MAX_INSTRUCTION` | `500` | Cap on the user's instruction text for `/doc edit` |
 | `MAX_QUERY_CHARS` | `1000` | Cap on `@bot` Q&A input length |
@@ -285,7 +283,7 @@ What's intentionally not hardened:
 
 **Bot replies in group don't reach you, but DMs work**, or you can't be added to the group via your phone number — your Signal account has **"Find by Phone Number"** disabled. The bot must address you by username or UUID instead. Use your UUID (visible in any envelope's `sourceUuid` or `source`) for `OWNER_ID`. Bot-to-non-findable-user sends require the username, e.g. `recipients=["yourname.42"]`.
 
-**`@Claude hello` in the group produces no log line** — `BOT_NAME` defaults to `Claude`. Either use that name, or set `BOT_NAME=somethingelse` in `.env` and restart. (Or set `BOT_UUID` and use Signal's native @mention picker, which doesn't depend on `BOT_NAME` at all.)
+**`@bot` in the group produces no log line** — make sure `BOT_UUID` is set in `.env` (see setup step 5). Without it, the bot ignores all mentions. Also confirm you're using Signal's native @mention picker (typing `@` and selecting from the list) rather than typing the name as plain text.
 
 **Edited `.env` but the bot doesn't see the new value** — `docker compose restart` reuses the existing container with old env. Use `docker compose up -d --force-recreate bot` to actually recreate it. Verify with `docker compose exec bot env | grep VAR_NAME`.
 

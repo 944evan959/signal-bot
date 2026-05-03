@@ -36,7 +36,6 @@ services:
       - signal-api
     environment:
       - SIGNAL_SERVICE=http://signal-api:8080
-      - BOT_NAME=${BOT_NAME:-Claude}
       - OWNER_ID=${OWNER_ID}
       - BOT_UUID=${BOT_UUID}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}
