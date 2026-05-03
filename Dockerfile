@@ -1,8 +1,15 @@
 # Pinned by digest so builds are reproducible and immune to tag-replacement.
 # Update by re-pulling the tag and copying the new digest in:
-#   docker pull python:3.12-slim-bookworm
-#   docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim-bookworm
-FROM python:3.12-slim-bookworm@sha256:d384a24aebd583543abb00fa47b2a434ec3a96559c6f244cc3cfcbe9e136a798
+#   docker pull python:3.12-slim-trixie
+#   docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim-trixie
+#
+# Using slim-trixie (Debian 13) over slim-bookworm (Debian 12) — newer
+# baseline, fewer accumulated CVEs in distro packages.
+#
+# Fallback: if trixie ever introduces a Python wheel-compatibility issue or
+# the CVE situation reverses, the previously-tested bookworm digest is:
+#   python:3.12-slim-bookworm@sha256:d384a24aebd583543abb00fa47b2a434ec3a96559c6f244cc3cfcbe9e136a798
+FROM python:3.12-slim-trixie@sha256:4386a385d81dba9f72ed72a6fe4237755d7f5440c84b417650f38336bbc43117
 
 WORKDIR /app
 
