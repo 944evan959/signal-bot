@@ -1,0 +1,66 @@
+
+
+## Overview
+
+                   │               Analyzed Image               
+───────────────────┼────────────────────────────────────────────
+ Target            │  signal-bot-bot:latest                     
+   digest          │  093ef1d678cc                              
+   platform        │ linux/amd64                                
+   provenance      │ git@github.com:944evan959/signal-bot.git   
+                   │  https://github.com/944evan959/signal-bot/blob/bc5d491b88bfbd0b7dcb9f2cf57ef82f23d1a637  
+   vulnerabilities │    0C     1H     4M     0L                 
+   size            │ 54 MB                                      
+   packages        │ 145                                        
+
+
+## Packages and Vulnerabilities
+
+   0C     1H     1M     0L  glibc 2.41-12+deb13u2
+pkg:deb/debian/glibc@2.41-12%2Bdeb13u2?os_distro=trixie&os_name=debian&os_version=13
+
+    ✗ HIGH CVE-2026-5435
+      https://scout.docker.com/v/CVE-2026-5435?s=debian&n=glibc&ns=debian&t=deb&osn=debian&osv=13&vr=%3E0
+      Affected range : >0        
+      Fixed version  : not fixed 
+    
+    ✗ MEDIUM CVE-2026-6238
+      https://scout.docker.com/v/CVE-2026-6238?s=debian&n=glibc&ns=debian&t=deb&osn=debian&osv=13&vr=%3E0
+      Affected range : >0        
+      Fixed version  : not fixed 
+    
+
+   0C     0H     2M     0L  pip 25.0.1
+pkg:pypi/pip@25.0.1
+
+    ✗ MEDIUM CVE-2025-8869 [Improper Link Resolution Before File Access ('Link Following')]
+      https://scout.docker.com/v/CVE-2025-8869?s=github&n=pip&t=pypi&vr=%3C%3D25.2
+      Affected range : <=25.2                                                          
+      Fixed version  : 25.3                                                            
+      CVSS Score     : 5.9                                                             
+      CVSS Vector    : CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:A/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N 
+    
+    ✗ MEDIUM CVE-2026-3219 [Unrestricted Upload of File with Dangerous Type]
+      https://scout.docker.com/v/CVE-2026-3219?s=github&n=pip&t=pypi&vr=%3C%3D26.0.1
+      Affected range : <=26.0.1                                                        
+      Fixed version  : not fixed                                                       
+      CVSS Score     : 4.6                                                             
+      CVSS Vector    : CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:A/VC:N/VI:L/VA:N/SC:N/SI:N/SA:N 
+    
+
+   0C     0H     1M     0L  tar 1.35+dfsg-3.1
+pkg:deb/debian/tar@1.35%2Bdfsg-3.1?os_distro=trixie&os_name=debian&os_version=13
+
+    ✗ MEDIUM CVE-2025-45582
+      https://scout.docker.com/v/CVE-2025-45582?s=debian&n=tar&ns=debian&t=deb&osn=debian&osv=13&vr=%3E%3D1.35%2Bdfsg-3.1
+      Affected range : >=1.35+dfsg-3.1 
+      Fixed version  : not fixed       
+    
+
+
+5 vulnerabilities found in 3 packages
+  CRITICAL  0 
+  HIGH      1 
+  MEDIUM    4 
+  LOW       0 
+
