@@ -5,9 +5,9 @@
 [![Docker](https://img.shields.io/badge/docker-compose-2496ed.svg)](https://docs.docker.com/compose/)
 [![Local LLM](https://img.shields.io/badge/LLM-Ollama-black.svg)](https://ollama.com)
 
-A Signal bot that manages a shared document and answers questions, powered entirely by a local [Ollama](https://ollama.com) model. No API keys, no cloud services, no usage fees.
+A Signal bot that maintains shared documents and answers questions, powered entirely by a local [Ollama](https://ollama.com) model. No API keys, no cloud services, no usage fees.
 
-Works in a group chat for everyone, and as a private assistant in DMs for the owner.
+Each chat (group or DM) has its own independent document set, and admins can keep multiple named docs side-by-side per chat. Works for everyone in a claimed group, and as a private assistant in DMs for the owner.
 
 ## What it does
 
@@ -187,11 +187,13 @@ MODEL_SEARCH=llama3.2       # smaller/faster model for Q&A
 
 | Value | Behaviour |
 |---|---|
-| `auto` *(default)* | Keyword heuristic — searches DuckDuckGo only on time-sensitive queries (price, news, latest, current, etc.) |
+| *(unset / empty — what `env.example` ships with)* | Training knowledge only, with a stale-data warning footer. Fully local — no outbound HTTP. |
+| `auto` | Keyword heuristic — searches DuckDuckGo only on time-sensitive queries (price, news, latest, current, etc.) |
 | `duckduckgo` | Always searches before answering |
-| *(unset)* | Training knowledge only, with a stale-data warning footer |
 
 The keyword list is at the top of [bot.py](bot.py) under `_TIMELY_PATTERN` — edit it freely.
+
+> **Search is opt-in.** The `ddgs` Python package is **commented out** in [requirements.txt](requirements.txt) by default to keep the dependency surface small. If you set `SEARCH_FALLBACK=auto` or `duckduckgo`, uncomment the `ddgs` line and rebuild — otherwise search calls fail silently and the bot answers from training knowledge.
 
 **Customise `/doc edit` prompt** — `EDIT_SYSTEM_PROMPT` in [bot.py](bot.py).
 
@@ -203,11 +205,80 @@ The keyword list is at the top of [bot.py](bot.py) under `_TIMELY_PATTERN` — e
 
 Changes are picked up on the very next message — no restart needed.
 
+**Multiple documents per chat** — each group chat (and the DM context) has its own independent document namespace under `data/docs/`. Within a chat, admins can manage as many named docs as they want:
+
+```
+/doc list                              # show all docs in this chat
+/doc create recipes                    # create a new named doc
+/doc recipes edit add a carbonara recipe
+/doc recipes share                     # send recipes.md as a file
+/doc recipes delete                    # remove the doc (admin)
+```
+
+Doc names use letters, digits, `_`, `-` (1–40 chars). The default doc is auto-created the first time you run `/doc edit` in a chat.
+
+**Long edits** — by default each `/doc edit` is capped at `LLM_MAX_TOKENS` (≈12K chars output) to bound runaway prompts. Admins can opt into a larger cap per call:
+
+```
+/doc edit --long restructure into 6 detailed sections
+```
+
+`--long` raises the cap to `LLM_LARGE_MAX_TOKENS` (≈40K chars by default) for that one edit only.
+
+**Plain-prose replies** — the bot strips disruptive markdown (headers, bold, italic asterisks, code fences, link syntax) from Q&A responses so they read cleanly in Signal. Document content is left as markdown.
+
+---
+
+## Configuration knobs
+
+All optional, all in `.env`. Defaults in [env.example](env.example).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BOT_NAME` | `Claude` | Text-trigger name (`@<BOT_NAME> question`); irrelevant if `BOT_UUID` is set |
+| `MAX_INLINE_CHARS` | `1500` | `/doc` view truncation point — beyond this, send via `/doc share` |
+| `MAX_INSTRUCTION` | `500` | Cap on the user's instruction text for `/doc edit` |
+| `MAX_QUERY_CHARS` | `1000` | Cap on `@bot` Q&A input length |
+| `MAX_DOC_CHARS` | `50000` | Hard ceiling on persisted doc size |
+| `MAX_DOC_INPUT_CHARS` | `20000` | Largest doc accepted as input to `/doc edit` |
+| `LLM_MAX_TOKENS` | `3000` | Per-call output cap (~12K chars) |
+| `LLM_LARGE_MAX_TOKENS` | `10000` | Output cap for admin `--long` edits (~40K chars) |
+| `LLM_TIMEOUT` | `180` | Wall-clock timeout per Ollama call (seconds) |
+| `PROGRESS_NUDGE_SECONDS` | `30` | Seconds before sending "still working" message; set `0` to disable |
+| `RATE_LIMIT_MAX` | `10` | Max messages per `RATE_LIMIT_WINDOW` per sender (owner exempt); `0` to disable |
+| `RATE_LIMIT_WINDOW` | `60` | Sliding window in seconds for the rate limit |
+| `SEARCH_FALLBACK` | *empty* | Web search mode: empty (off), `auto`, or `duckduckgo` |
+
+---
+
+## Security posture
+
+What's hardened:
+
+- **Container runs as unprivileged user**, with a read-only root filesystem (`/tmp` is the only writable mount), all Linux capabilities dropped, `no-new-privileges`, and CPU/RAM limits.
+- **Per-sender rate limiting** (`RATE_LIMIT_MAX`/`RATE_LIMIT_WINDOW`) on every inbound message, owner exempt.
+- **Watchdog timeout** (`LLM_TIMEOUT`) on every Ollama call, enforced from the bot's own thread so a stalled model can't hang the bot.
+- **Output caps** on every LLM call (`LLM_MAX_TOKENS`) bound runaway generations; an explicit admin `--long` flag is the only way past the default.
+- **Pre-edit document backup** — `/doc edit` snapshots the current doc to `<name>.md.bak` before overwriting. Bad LLM edits are recoverable by `cp <name>.md.bak <name>.md`.
+- **Edit-summary line delta** in every `/doc edit` reply makes silent rewrites hard to miss.
+- **Prompt-injection sanitiser** strips role markers (`system:`, `user:`, `assistant:`) from every user-supplied LLM input.
+- **Markdown stripping** on chat replies prevents the model from leaking literal formatting noise.
+- **Group approval is explicit** — `/group claim` from the owner is required before the bot responds in any group; no implicit auto-onboarding.
+- **Search is off by default** — fully local. The `ddgs` package isn't even installed unless you uncomment it.
+
+What's intentionally not hardened:
+
+- Documents are stored unencrypted on disk. If the host filesystem is compromised, so is your data.
+- `/doc` (view) is open to all group members of an approved group. Don't put data in there that isn't appropriate for everyone in the group to see.
+- Admins are trusted with whatever they can write into a doc via `/doc edit`. The trust boundary is the admin set.
+
 ---
 
 ## Troubleshooting
 
 **`receive() failed` or no DMs arriving** — usually a profile/contact issue. Confirm step 4 ran successfully. If the bot's account is brand-new, send it a message from yourself first to establish a session.
+
+**`/doc edit` produced something terrible** — every edit snapshots the previous version to `<name>.md.bak` in the same directory. Recover with `cp ./data/docs/<context>/<name>.md.bak ./data/docs/<context>/<name>.md`. The backup is overwritten on the next edit, so save copies somewhere else if you might need an older version.
 
 **`send() HTTP 400 ... "Invalid identifier"`** — the bot's group recipient construction is wrong. The wrapper expects `group.<base64(internal_id)>`; this is handled automatically, but if you've modified the routing code, check [bot.py](bot.py)'s `route()` function.
 
@@ -232,15 +303,17 @@ signal-ollama-bot/
 ├── secrets/
 │   └── bot_number.txt  # bot's phone number — Docker secret
 ├── data/
-│   ├── persona.md      # bot identity + relational context (auto-created)
-│   ├── docs/           # per-chat document namespaces
-│   │   ├── dm/         # owner-DM documents
-│   │   │   └── default.md
-│   │   └── <group-key>/   # one subdir per claimed group
-│   │       ├── default.md
-│   │       └── meeting-notes.md
-│   ├── groups.txt      # claimed group IDs (managed via /group claim)
-│   └── admins.txt      # runtime-added admins (managed via /admins add)
+│   ├── persona.md          # bot identity + relational context (auto-created)
+│   ├── groups.txt          # claimed group IDs (managed via /group claim)
+│   ├── admins.txt          # runtime-added admins (managed via /admins add)
+│   └── docs/               # per-chat document namespaces
+│       ├── dm/             # owner-DM documents
+│       │   ├── default.md
+│       │   └── default.md.bak    # pre-edit backup (overwritten each edit)
+│       └── <group-key>/    # one subdir per claimed group
+│           ├── default.md
+│           ├── meeting-notes.md
+│           └── meeting-notes.md.bak
 └── signal-config/      # Signal keys, owned by signal-api (auto-created)
 ```
 
