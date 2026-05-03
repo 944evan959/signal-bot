@@ -21,6 +21,27 @@ services:
       - ./signal-config:/home/.local/share/signal-cli
     networks:
       - internal
+    # ── Container hardening ──────────────────────────────────────────────────
+    # The image's entrypoint runs root-side setup (usermod, chown), then
+    # drops to UID 1000 via setpriv. That privilege-drop needs SETUID and
+    # SETGID; CHOWN is needed for the chown of the data volume on Linux.
+    # All three are used during ~1s of startup, after which signal-cli-rest-api
+    # runs as UID 1000 with no caps at all (setpriv strips inheritables).
+    # Net steady-state: same as cap_drop ALL.
+    # read_only is omitted — entrypoint writes /etc/group during usermod sync.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
     logging:
       driver: json-file
       options:
