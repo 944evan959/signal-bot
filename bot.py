@@ -58,7 +58,7 @@ log = logging.getLogger(__name__)
 SIGNAL_SERVICE   = os.environ.get("SIGNAL_SERVICE", "http://localhost:8080")
 BOT_NUMBER       = os.environ["BOT_NUMBER"]
 BOT_NAME         = os.environ.get("BOT_NAME", "Claude")
-DOC_PATH         = Path(os.environ.get("DOC_PATH", "document.md"))
+DOC_DIR          = Path(os.environ.get("DOC_DIR", "docs"))
 PERSONA_PATH     = Path(os.environ.get("PERSONA_PATH", "persona.md"))
 GROUPS_FILE      = Path(os.environ.get("GROUPS_FILE", "groups.txt"))
 ADMINS_FILE      = Path(os.environ.get("ADMINS_FILE", "admins.txt"))
@@ -79,6 +79,10 @@ MAX_DOC_INPUT_CHARS = int(os.environ.get("MAX_DOC_INPUT_CHARS", "20000"))
 # while bounding runaway behavior. Bump in .env if you hit truncations
 # on large /doc edit operations.
 LLM_MAX_TOKENS      = int(os.environ.get("LLM_MAX_TOKENS", "3000"))
+# Larger cap admins can opt into per-edit with `--long`. Used only when an
+# admin explicitly asks for it — keeps the safe default tight while leaving
+# room for legitimate large rewrites.
+LLM_LARGE_MAX_TOKENS = int(os.environ.get("LLM_LARGE_MAX_TOKENS", "10000"))
 LLM_TIMEOUT         = int(os.environ.get("LLM_TIMEOUT",   "180"))
 # Send a "still working" nudge if a /doc edit hasn't completed in this many
 # seconds. Set to 0 to disable.
@@ -202,18 +206,24 @@ _llm_executor = concurrent.futures.ThreadPoolExecutor(
 )
 
 
-def _call_ollama(*, model: str, messages: list, **kwargs):
+def _call_ollama(*, model: str, messages: list,
+                 max_tokens: int | None = None, **kwargs):
     """Run an Ollama chat completion with a hard wall-clock timeout.
 
     Raises TimeoutError if LLM_TIMEOUT elapses before the call returns —
     handle_doc and handle_mention already surface a friendly message for
-    that exception class."""
+    that exception class.
+
+    max_tokens defaults to LLM_MAX_TOKENS; pass an int to override per-call
+    (e.g. for admin-opt-in `--long` edits)."""
+    cap = max_tokens if max_tokens is not None else LLM_MAX_TOKENS
+
     def _do_call():
         client = _ollama_client()
         return client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=LLM_MAX_TOKENS,
+            max_tokens=cap,
             timeout=LLM_TIMEOUT,    # SDK's own timeout, best-effort
             **kwargs,
         )
@@ -262,13 +272,17 @@ def _query_needs_search(query: str) -> bool:
     return needs
 
 
-def ai_edit_doc(doc: str, instruction: str) -> str:
+def ai_edit_doc(doc: str, instruction: str,
+                max_tokens: int | None = None) -> str:
     """Apply an edit instruction to a markdown document via Ollama.
 
     Raises ValueError if the input doc exceeds MAX_DOC_INPUT_CHARS (refusing
     rather than silently truncating, since the model's full-doc replacement
     would lose anything past the truncation point), or if the model returns
-    empty/blank content."""
+    empty/blank content.
+
+    max_tokens defaults to LLM_MAX_TOKENS; passed through for admin-opt-in
+    long edits."""
     if len(doc) > MAX_DOC_INPUT_CHARS:
         raise ValueError(
             f"Document is {len(doc)} chars; max for editing is "
@@ -278,6 +292,7 @@ def ai_edit_doc(doc: str, instruction: str) -> str:
     response = _call_ollama(
         model=_MODEL_EDIT,
         temperature=0.2,
+        max_tokens=max_tokens,
         messages=[
             {"role": "system", "content": EDIT_SYSTEM_PROMPT},
             {"role": "user",   "content": f"Document:\n\n{doc}\n\nInstruction: {instruction}"},
@@ -520,33 +535,94 @@ STARTER_DOC = (
     "Use `/doc edit add an introduction` to get started.\n"
 )
 
-def read_doc() -> str:
-    if not DOC_PATH.exists():
-        DOC_PATH.write_text(STARTER_DOC)
-    return DOC_PATH.read_text()
+# Documents are namespaced by chat context: each Signal group gets its own
+# subdirectory under DOC_DIR, and DMs share a single `dm` namespace. Within
+# a context, multiple named documents can coexist, each as <name>.md.
+DEFAULT_DOC_NAME = "default"
+DOC_NAME_RE      = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
 
-def write_doc(content: str):
-    """Persist content to DOC_PATH. Refuses oversized writes and snapshots the
-    previous version to DOC_PATH.bak so a bad edit can be recovered manually."""
+# Reserved verbs can't be used as document names — would collide with the
+# command parser. See handle_doc().
+RESERVED_DOC_VERBS = frozenset({
+    "list", "view", "edit", "share", "status", "create", "delete", "help",
+})
+
+
+def _group_key(group_id: str | None, is_dm: bool) -> str:
+    """Filesystem-safe namespace key for the current chat context."""
+    if is_dm or not group_id:
+        return "dm"
+    # Translate base64's `/`, `=`, `+` to safe equivalents.
+    return group_id.translate(str.maketrans("/=+", "_-."))
+
+
+def _ctx_dir(group_key: str) -> Path:
+    d = DOC_DIR / group_key
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _doc_path(group_key: str, name: str) -> Path:
+    return _ctx_dir(group_key) / f"{name}.md"
+
+
+def is_valid_doc_name(name: str) -> bool:
+    return (bool(DOC_NAME_RE.match(name))
+            and name.lower() not in RESERVED_DOC_VERBS)
+
+
+def list_docs(group_key: str) -> list[str]:
+    d = _ctx_dir(group_key)
+    return sorted(p.stem for p in d.glob("*.md"))
+
+
+def read_doc(group_key: str, name: str = DEFAULT_DOC_NAME) -> str:
+    path = _doc_path(group_key, name)
+    if not path.exists():
+        if name == DEFAULT_DOC_NAME:
+            path.write_text(STARTER_DOC)
+        else:
+            raise FileNotFoundError(name)
+    return path.read_text()
+
+
+def write_doc(group_key: str, name: str, content: str) -> None:
+    """Persist a doc. Refuses oversized writes and snapshots the previous
+    version to <name>.md.bak so a bad edit can be recovered manually."""
     if len(content) > MAX_DOC_CHARS:
         raise ValueError(
             f"Document content {len(content)} chars exceeds "
             f"MAX_DOC_CHARS={MAX_DOC_CHARS}"
         )
-    if DOC_PATH.exists():
-        backup = DOC_PATH.with_suffix(DOC_PATH.suffix + ".bak")
-        backup.write_text(DOC_PATH.read_text())
-    DOC_PATH.write_text(content)
-    log.info("Document saved (%d chars)", len(content))
+    path = _doc_path(group_key, name)
+    if path.exists():
+        backup = path.with_suffix(".md.bak")
+        backup.write_text(path.read_text())
+    path.write_text(content)
+    log.info("Document saved: %s/%s (%d chars)", group_key, name, len(content))
 
-def doc_status() -> str:
-    content = read_doc()
+
+def delete_doc(group_key: str, name: str) -> bool:
+    """Remove a doc and its backup. Returns False if the doc doesn't exist."""
+    path = _doc_path(group_key, name)
+    if not path.exists():
+        return False
+    backup = path.with_suffix(".md.bak")
+    path.unlink()
+    if backup.exists():
+        backup.unlink()
+    return True
+
+
+def doc_status(group_key: str, name: str = DEFAULT_DOC_NAME) -> str:
+    path    = _doc_path(group_key, name)
+    content = read_doc(group_key, name)
     lines   = content.splitlines()
     words   = len(content.split())
-    mtime   = datetime.fromtimestamp(DOC_PATH.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    mtime   = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
     title   = next((l.lstrip("#").strip() for l in lines if l.strip()), "Untitled")
     return (
-        f"📄 *{title}*\n"
+        f"📄 *{name}* — {title}\n"
         f"Lines : {len(lines)}\n"
         f"Words : {words}\n"
         f"Saved : {mtime}"
@@ -593,98 +669,251 @@ def send_with_attachment(recipient: str, text: str, filepath: Path):
 
 DOC_HELP = (
     "📄 *Document commands:*\n"
-    "`/doc`                    — view document inline\n"
-    "`/doc status`             — word count & last-modified\n"
-    "`/doc share`              — send document as a file *(admins only)*\n"
-    "`/doc edit <instruction>` — AI-powered edit *(admins only)*\n\n"
-    "*Examples:*\n"
-    "`/doc edit add a section on Q3 goals`\n"
-    "`/doc edit rewrite the intro to be more concise`"
+    "`/doc`                              — view default document\n"
+    "`/doc list`                         — list documents in this chat\n"
+    "`/doc status`                       — default doc word count & last-modified\n"
+    "`/doc share`                        — send default doc as a file *(admin)*\n"
+    "`/doc edit <instruction>`           — AI-edit default doc *(admin)*\n"
+    "`/doc edit --long <instruction>`    — AI-edit with larger output cap *(admin)*\n"
+    "`/doc create <name>`                — create new doc *(admin)*\n"
+    "`/doc <name>`                       — view named doc\n"
+    "`/doc <name> status`                — named doc info\n"
+    "`/doc <name> share`                 — send named doc as a file *(admin)*\n"
+    "`/doc <name> edit <instruction>`    — AI-edit named doc *(admin)*\n"
+    "`/doc <name> delete`                — delete named doc *(admin)*\n\n"
+    "`--long` raises the per-edit output cap for legitimate large rewrites.\n"
+    "Doc names: letters, digits, `_`, `-`. Each chat (group or DM) has its\n"
+    "own independent document set."
 )
 
-def handle_doc(recipient: str, args: str, source: str, source_uuid: str):
-    args = args.strip()
 
-    if args in ("", "view"):
-        content = read_doc()
-        if len(content) > MAX_INLINE_CHARS:
-            hint = ("use `/doc share` for the full file"
-                    if is_admin(source, source_uuid)
-                    else "ask an admin for the full file")
-            send(recipient, content[:MAX_INLINE_CHARS] + f"\n\n…*(truncated — {hint})*")
-        else:
-            send(recipient, content)
+def _doc_view(recipient: str, group_key: str, name: str,
+              source: str, source_uuid: str):
+    try:
+        content = read_doc(group_key, name)
+    except FileNotFoundError:
+        send(recipient, f"❌ No document named `{name}`. Use `/doc list` to see what's available.")
+        return
+    if len(content) > MAX_INLINE_CHARS:
+        hint = ("use `/doc share` for the full file"
+                if is_admin(source, source_uuid)
+                else "ask an admin for the full file")
+        send(recipient, content[:MAX_INLINE_CHARS] + f"\n\n…*(truncated — {hint})*")
+    else:
+        send(recipient, content)
 
-    elif args == "status":
-        send(recipient, doc_status())
 
-    elif args == "share":
-        if not is_admin(source, source_uuid):
-            send(recipient, "🔒 Only admins can share the document as a file.")
-            log.info("Share denied source=%s uuid=%s", source, source_uuid)
-            return
-        read_doc()  # Ensure DOC_PATH exists (writes the starter on first use)
-        send_with_attachment(recipient, "📎 Current document:", DOC_PATH)
+def _doc_share(recipient: str, group_key: str, name: str):
+    try:
+        read_doc(group_key, name)  # ensure file exists; auto-creates default
+    except FileNotFoundError:
+        send(recipient, f"❌ No document named `{name}`.")
+        return
+    send_with_attachment(recipient, f"📎 {name}:", _doc_path(group_key, name))
 
-    elif args.lower().startswith("edit "):
-        if not is_admin(source, source_uuid):
-            send(recipient, "🔒 Only admins can edit the document.")
-            log.info("Write denied source=%s uuid=%s", source, source_uuid)
-            return
 
-        raw_instruction = args[5:].strip()
-        if not raw_instruction:
-            send(recipient, "⚠️ Usage: `/doc edit <instruction>`")
-            return
+def _doc_status(recipient: str, group_key: str, name: str):
+    try:
+        send(recipient, doc_status(group_key, name))
+    except FileNotFoundError:
+        send(recipient, f"❌ No document named `{name}`.")
 
-        instruction = sanitize_instruction(raw_instruction)
-        if len(instruction) != len(raw_instruction):
-            log.info("Instruction sanitized/truncated (source=%s)", source)
 
-        send(recipient, "✏️ Editing document…")
-        # Schedule a "still working" nudge if the call hasn't completed in
-        # PROGRESS_NUDGE_SECONDS. Cancelled by finally on success/failure.
-        nudge = threading.Timer(
-            PROGRESS_NUDGE_SECONDS,
-            lambda: send(recipient,
-                         f"⏳ Still working… large edits can take up to "
-                         f"{LLM_TIMEOUT}s. Hang tight."),
-        )
-        nudge.start()
+def _doc_list(recipient: str, group_key: str):
+    docs = list_docs(group_key)
+    if not docs:
+        send(recipient, "📄 No documents in this chat yet. Use `/doc edit <instruction>` "
+                        "to create the default, or `/doc create <name>` to add a new one.")
+        return
+    lines = ["📄 *Documents in this chat:*"]
+    for d in docs:
+        lines.append(f"• `{d}`")
+    send(recipient, "\n".join(lines))
+
+
+def _doc_create(recipient: str, group_key: str, name: str,
+                source: str, source_uuid: str):
+    if not is_admin(source, source_uuid):
+        send(recipient, "🔒 Only admins can create documents.")
+        return
+    if not is_valid_doc_name(name):
+        send(recipient,
+             f"❌ Invalid doc name `{name}`. Use letters, digits, `_`, or `-` "
+             f"(1–40 chars). Reserved verbs not allowed: "
+             f"{', '.join(sorted(RESERVED_DOC_VERBS))}.")
+        return
+    path = _doc_path(group_key, name)
+    if path.exists():
+        send(recipient, f"⚠️ Document `{name}` already exists.")
+        return
+    path.write_text(f"# {name}\n\nThis document is empty.\n")
+    log.info("Doc created: %s/%s by source=%s", group_key, name, source)
+    send(recipient, f"✅ Created `{name}`. Use `/doc {name} edit <instruction>` to write into it.")
+
+
+def _doc_delete(recipient: str, group_key: str, name: str,
+                source: str, source_uuid: str):
+    if not is_admin(source, source_uuid):
+        send(recipient, "🔒 Only admins can delete documents.")
+        return
+    if name == DEFAULT_DOC_NAME:
+        send(recipient, f"❌ Can't delete the default document. "
+                        f"Use `/doc edit clear all content` to empty it instead.")
+        return
+    if delete_doc(group_key, name):
+        log.info("Doc deleted: %s/%s by source=%s", group_key, name, source)
+        send(recipient, f"🗑️ Deleted `{name}`.")
+    else:
+        send(recipient, f"⚠️ No document named `{name}`.")
+
+
+def _doc_edit(recipient: str, group_key: str, name: str, raw_instruction: str,
+              source: str, source_uuid: str):
+    if not is_admin(source, source_uuid):
+        send(recipient, "🔒 Only admins can edit documents.")
+        log.info("Write denied source=%s uuid=%s", source, source_uuid)
+        return
+    raw_instruction = raw_instruction.strip()
+
+    # Admin opt-in: leading `--long` enables LLM_LARGE_MAX_TOKENS for this
+    # one call. Lets admins explicitly request large rewrites while keeping
+    # the safe default tight against runaway prompts.
+    long_mode = False
+    if raw_instruction.startswith("--long"):
+        rest = raw_instruction[len("--long"):]
+        if not rest or rest[0].isspace():
+            long_mode = True
+            raw_instruction = rest.strip()
+
+    if not raw_instruction:
+        send(recipient, f"⚠️ Usage: `/doc{' '+name if name != DEFAULT_DOC_NAME else ''} edit [--long] <instruction>`")
+        return
+
+    instruction = sanitize_instruction(raw_instruction)
+    if len(instruction) != len(raw_instruction):
+        log.info("Instruction sanitized/truncated (source=%s)", source)
+
+    mode_tag    = " (long mode)" if long_mode else ""
+    edit_tokens = LLM_LARGE_MAX_TOKENS if long_mode else LLM_MAX_TOKENS
+    log.info("Edit start: %s/%s long_mode=%s max_tokens=%d source=%s",
+             group_key, name, long_mode, edit_tokens, source)
+    send(recipient, f"✏️ Editing `{name}`{mode_tag}…")
+    nudge = threading.Timer(
+        PROGRESS_NUDGE_SECONDS,
+        lambda: send(recipient,
+                     f"⏳ Still working… large edits can take up to {LLM_TIMEOUT}s. Hang tight."),
+    )
+    nudge.start()
+    try:
         try:
-            old_doc = read_doc()
-            new_doc = ai_edit_doc(old_doc, instruction)
-            write_doc(new_doc)
-            old_lines = len(old_doc.splitlines())
-            new_lines = len(new_doc.splitlines())
-            delta     = new_lines - old_lines
-            sign      = f"+{delta}" if delta > 0 else str(delta)
-            send(recipient,
-                 f"✅ Done. Lines: {old_lines} → {new_lines} ({sign})\n\n"
-                 f"{doc_status()}")
-        except ValueError as exc:
-            log.warning("Edit rejected (source=%s): %s", source, exc)
-            send(recipient, f"❌ Edit failed: {exc}")
-        except (TimeoutError, requests.Timeout) as exc:
+            old_doc = read_doc(group_key, name)
+        except FileNotFoundError:
+            send(recipient, f"❌ No document named `{name}`. Create it with `/doc create {name}`.")
+            return
+        new_doc = ai_edit_doc(old_doc, instruction, max_tokens=edit_tokens)
+        write_doc(group_key, name, new_doc)
+        old_lines = len(old_doc.splitlines())
+        new_lines = len(new_doc.splitlines())
+        delta     = new_lines - old_lines
+        sign      = f"+{delta}" if delta > 0 else str(delta)
+        send(recipient,
+             f"✅ Done. Lines: {old_lines} → {new_lines} ({sign})\n\n"
+             f"{doc_status(group_key, name)}")
+    except ValueError as exc:
+        log.warning("Edit rejected (source=%s): %s", source, exc)
+        send(recipient, f"❌ Edit failed: {exc}")
+    except TimeoutError as exc:
+        log.warning("Edit timed out (source=%s): %s", source, exc)
+        send(recipient,
+             f"⏱️ Edit timed out after {LLM_TIMEOUT}s — the model may be "
+             f"overloaded or the request is too large. Try a simpler instruction.")
+    except Exception as exc:
+        if "Timeout" in type(exc).__name__:
             log.warning("Edit timed out (source=%s): %s", source, exc)
             send(recipient,
                  f"⏱️ Edit timed out after {LLM_TIMEOUT}s — the model may be "
                  f"overloaded or the request is too large. Try a simpler instruction.")
-        except Exception as exc:
-            # The OpenAI client raises its own APITimeoutError; catch by name.
-            if "Timeout" in type(exc).__name__:
-                log.warning("Edit timed out (source=%s): %s", source, exc)
-                send(recipient,
-                     f"⏱️ Edit timed out after {LLM_TIMEOUT}s — the model may be "
-                     f"overloaded or the request is too large. Try a simpler instruction.")
-            else:
-                log.error("ai_edit_doc failed: %s", exc)
-                send(recipient, "❌ Edit failed. Please try again.")
-        finally:
-            nudge.cancel()
+        else:
+            log.error("ai_edit_doc failed: %s", exc)
+            send(recipient, "❌ Edit failed. Please try again.")
+    finally:
+        nudge.cancel()
 
-    else:
+
+def handle_doc(recipient: str, args: str, source: str, source_uuid: str,
+               group_key: str):
+    args = args.strip()
+
+    if not args:
+        _doc_view(recipient, group_key, DEFAULT_DOC_NAME, source, source_uuid)
+        return
+
+    parts = args.split(maxsplit=1)
+    first = parts[0].lower()
+    rest  = parts[1] if len(parts) > 1 else ""
+
+    # Top-level commands that don't operate on a "current" doc
+    if first == "list":
+        _doc_list(recipient, group_key)
+        return
+    if first == "help":
         send(recipient, DOC_HELP)
+        return
+    if first == "create":
+        if not rest.strip():
+            send(recipient, "⚠️ Usage: `/doc create <name>`")
+            return
+        _doc_create(recipient, group_key, rest.strip().split()[0], source, source_uuid)
+        return
+
+    # Verbs operating on the default doc: /doc <verb> ...
+    if first in ("view", "status", "share", "edit", "delete"):
+        if first == "delete":
+            send(recipient, "❌ Use `/doc <name> delete` to delete a named doc.")
+            return
+        _dispatch_doc_verb(recipient, group_key, DEFAULT_DOC_NAME, first, rest,
+                           source, source_uuid)
+        return
+
+    # Otherwise first should be a doc name: /doc <name> [verb ...]
+    if not is_valid_doc_name(first):
+        send(recipient, DOC_HELP)
+        return
+    doc_name = first
+
+    if not rest:
+        # Just a name → view it
+        _doc_view(recipient, group_key, doc_name, source, source_uuid)
+        return
+
+    sub_parts = rest.split(maxsplit=1)
+    verb      = sub_parts[0].lower()
+    verb_args = sub_parts[1] if len(sub_parts) > 1 else ""
+
+    if verb in ("view", "status", "share", "edit", "delete"):
+        _dispatch_doc_verb(recipient, group_key, doc_name, verb, verb_args,
+                           source, source_uuid)
+    else:
+        send(recipient,
+             f"❌ Unknown verb `{verb}`. Try: view, edit, share, status, delete.")
+
+
+def _dispatch_doc_verb(recipient: str, group_key: str, name: str, verb: str,
+                       verb_args: str, source: str, source_uuid: str):
+    if verb == "view":
+        _doc_view(recipient, group_key, name, source, source_uuid)
+    elif verb == "status":
+        _doc_status(recipient, group_key, name)
+    elif verb == "share":
+        if not is_admin(source, source_uuid):
+            send(recipient, "🔒 Only admins can share the document as a file.")
+            log.info("Share denied source=%s uuid=%s", source, source_uuid)
+            return
+        _doc_share(recipient, group_key, name)
+    elif verb == "edit":
+        _doc_edit(recipient, group_key, name, verb_args, source, source_uuid)
+    elif verb == "delete":
+        _doc_delete(recipient, group_key, name, source, source_uuid)
 
 
 def handle_mention(recipient: str, query: str):
@@ -818,7 +1047,8 @@ def route(envelope: dict):
         recipient = source
         log.info("DM source=%s uuid=%s", source, source_uuid)
         if text.startswith("/doc"):
-            handle_doc(recipient, text[4:], source, source_uuid)
+            handle_doc(recipient, text[4:], source, source_uuid,
+                       _group_key(None, is_dm=True))
         elif text.strip().startswith("/admins"):
             handle_admins(recipient, text.strip()[7:], source, source_uuid)
         else:
@@ -880,7 +1110,8 @@ def route(envelope: dict):
              cmd, source, source_uuid, is_admin(source, source_uuid))
 
     if cmd == "doc":
-        handle_doc(recipient, text[4:], source, source_uuid)
+        handle_doc(recipient, text[4:], source, source_uuid,
+                   _group_key(group_id, is_dm=False))
     elif cmd == "mention":
         # Strip both the structured-mention placeholder (￼) and the
         # legacy @<BOT_NAME> text trigger, then sanitize before LLM input.
@@ -992,12 +1223,12 @@ def main():
                 "Uncomment ddgs in requirements.txt and rebuild, or set "
                 "SEARCH_FALLBACK= to disable search.", _SEARCH_MODE)
 
-    # Touch persona/doc files at startup so they appear in ./data/ immediately
-    # (and any write-permission failures surface here instead of mid-query).
+    # Touch persona at startup so it appears in ./data/ immediately and any
+    # write-permission failures surface here instead of mid-query.
     persona = read_persona()
-    doc     = read_doc()
     log.info("Persona    : %s (%d chars)", PERSONA_PATH, len(persona))
-    log.info("Document   : %s (%d chars)", DOC_PATH,     len(doc))
+    DOC_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("Doc dir    : %s", DOC_DIR)
 
     receive_loop()
 

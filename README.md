@@ -13,10 +13,15 @@ Works in a group chat for everyone, and as a private assistant in DMs for the ow
 
 | Trigger | Where | Who | Action |
 |---|---|---|---|
-| `/doc` | Group + DM | Everyone (group) / owner (DM) | Show the document inline |
+| `/doc` | Group + DM | Everyone (group) / owner (DM) | View default document |
+| `/doc list` | Group + DM | Everyone | List all documents in this chat |
 | `/doc status` | Group + DM | Everyone | Word count, line count, last modified |
-| `/doc share` | Group + DM | Admins (group) / owner (DM) | Send the document as a file |
-| `/doc edit <instruction>` | Group + DM | Admins (group) / owner (DM) | AI rewrites the document |
+| `/doc share` | Group + DM | Admins (group) / owner (DM) | Send default doc as a file |
+| `/doc edit <instruction>` | Group + DM | Admins (group) / owner (DM) | AI-rewrites default doc |
+| `/doc edit --long <instruction>` | Group + DM | Admins | Same, with a larger output cap (`LLM_LARGE_MAX_TOKENS`) |
+| `/doc create <name>` | Group + DM | Admins | Create a new named document |
+| `/doc <name>` | Group + DM | Everyone | View named doc |
+| `/doc <name> <verb>` *(view/status/share/edit/delete)* | Group + DM | Per-verb (admin for write/share) | Operate on named doc |
 | `/group claim` | Group only | Owner | Approves the current group for bot use |
 | `/group leave` | Group only | Owner | Removes the current group from approved set |
 | `/admins` | Group + DM | Admins (group) / owner (DM) | List the configured owner and admin IDs |
@@ -227,8 +232,13 @@ signal-ollama-bot/
 ├── secrets/
 │   └── bot_number.txt  # bot's phone number — Docker secret
 ├── data/
-│   ├── document.md     # the shared document (auto-created)
 │   ├── persona.md      # bot identity + relational context (auto-created)
+│   ├── docs/           # per-chat document namespaces
+│   │   ├── dm/         # owner-DM documents
+│   │   │   └── default.md
+│   │   └── <group-key>/   # one subdir per claimed group
+│   │       ├── default.md
+│   │       └── meeting-notes.md
 │   ├── groups.txt      # claimed group IDs (managed via /group claim)
 │   └── admins.txt      # runtime-added admins (managed via /admins add)
 └── signal-config/      # Signal keys, owned by signal-api (auto-created)

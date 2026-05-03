@@ -38,7 +38,7 @@ services:
       - MODEL_EDIT=${MODEL_EDIT:-llama3.3}
       - MODEL_SEARCH=${MODEL_SEARCH:-llama3.3}
       - SEARCH_FALLBACK=${SEARCH_FALLBACK-auto}
-      - DOC_PATH=/data/document.md
+      - DOC_DIR=/data/docs
       - PERSONA_PATH=/data/persona.md
       - GROUPS_FILE=/data/groups.txt
       - ADMINS_FILE=/data/admins.txt
@@ -46,6 +46,7 @@ services:
       - MAX_DOC_CHARS=${MAX_DOC_CHARS-50000}
       - MAX_DOC_INPUT_CHARS=${MAX_DOC_INPUT_CHARS-20000}
       - LLM_MAX_TOKENS=${LLM_MAX_TOKENS-3000}
+      - LLM_LARGE_MAX_TOKENS=${LLM_LARGE_MAX_TOKENS-10000}
       - LLM_TIMEOUT=${LLM_TIMEOUT-180}
       - PROGRESS_NUDGE_SECONDS=${PROGRESS_NUDGE_SECONDS-30}
       - RATE_LIMIT_MAX=${RATE_LIMIT_MAX-10}
