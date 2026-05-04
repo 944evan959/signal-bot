@@ -1,6 +1,6 @@
 # Signal Ollama Bot
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
 [![Docker](https://img.shields.io/badge/docker-compose-2496ed.svg)](https://docs.docker.com/compose/)
 [![Local LLM](https://img.shields.io/badge/LLM-Ollama-black.svg)](https://ollama.com)
@@ -63,7 +63,7 @@ ollama run llama3.3 "say hello"   # smoke test
 ### 2. Configure
 
 ```bash
-git clone <this-repo> && cd signal-ollama-bot
+git clone <this-repo> && cd signal-bot
 cp env.example .env
 mkdir -p secrets && echo "+15550000000" > secrets/bot_number.txt && chmod 600 secrets/bot_number.txt
 ```
@@ -292,7 +292,7 @@ What's intentionally not hardened:
 ## File structure
 
 ```
-signal-ollama-bot/
+signal-bot/
 ├── bot.py              # main bot logic (websocket consumer + handlers)
 ├── docker-compose.yml  # signal-api + bot + secrets wiring
 ├── Dockerfile          # builds the bot container

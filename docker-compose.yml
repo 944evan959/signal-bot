@@ -51,7 +51,8 @@ services:
   # ── Bot ───────────────────────────────────────────────────────────────────────
   bot:
     build: .
-    container_name: signal-ollama-bot
+    image: signal-bot:local
+    container_name: signal-bot
     restart: unless-stopped
     depends_on:
       - signal-api
