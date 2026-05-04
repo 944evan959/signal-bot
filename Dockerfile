@@ -17,7 +17,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chmod=0644 bot.py .
+# Copy all top-level Python modules. The bot is split across several files —
+# bot.py is the entry point, the others are imported submodules.
+COPY --chmod=0644 *.py ./
 COPY --chmod=0755 entrypoint.sh /entrypoint.sh
 
 # Create a non-root user to run the bot
