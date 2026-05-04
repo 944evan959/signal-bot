@@ -38,6 +38,8 @@ import re
 import time
 import logging
 import base64
+import shutil
+import tarfile
 import threading
 import concurrent.futures
 import requests
@@ -570,7 +572,8 @@ DOC_NAME_RE      = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
 # Reserved verbs can't be used as document names — would collide with the
 # command parser. See handle_doc().
 RESERVED_DOC_VERBS = frozenset({
-    "list", "view", "edit", "share", "status", "create", "delete", "help",
+    "list", "view", "edit", "share", "status", "create", "delete",
+    "restore", "backup", "help",
 })
 
 
@@ -640,6 +643,39 @@ def delete_doc(group_key: str, name: str) -> bool:
     return True
 
 
+def pack_group_docs(group_key: str) -> Path | None:
+    """Bundle a group's current doc files into a gzipped tarball under /tmp.
+    Excludes .bak files (redundant — each .bak duplicates its .md). Returns
+    the archive path, or None if there are no current docs to pack."""
+    src_dir = DOC_DIR / group_key
+    if not src_dir.exists():
+        return None
+    current_docs = [p for p in src_dir.iterdir()
+                    if p.is_file() and not p.name.endswith(".bak")]
+    if not current_docs:
+        return None
+
+    archive = Path("/tmp") / f"{group_key}-docs.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        # arcname="docs" → recipients see a clean "docs/" folder when extracted,
+        # not the long internal group_key.
+        for doc in current_docs:
+            tar.add(doc, arcname=f"docs/{doc.name}")
+    log.info("Packed %d-byte archive of %s docs (%d files)",
+             archive.stat().st_size, group_key, len(current_docs))
+    return archive
+
+
+def delete_group_docs(group_key: str) -> bool:
+    """Recursively delete a group's doc directory. Returns True if removed."""
+    target = DOC_DIR / group_key
+    if not target.exists():
+        return False
+    shutil.rmtree(target)
+    log.info("Deleted doc directory: %s", target)
+    return True
+
+
 def doc_status(group_key: str, name: str = DEFAULT_DOC_NAME) -> str:
     path    = _doc_path(group_key, name)
     content = read_doc(group_key, name)
@@ -672,6 +708,27 @@ def send(recipient: str, text: str):
     except Exception as exc:
         log.error("send() error: %s", exc)
 
+
+def quit_signal_group(group_id: str) -> bool:
+    """Tell signal-api to leave the Signal group. Returns True on success.
+
+    Failures here are logged but non-fatal — the caller should still proceed
+    with the local-state cleanup (removing the group from groups.txt) so the
+    bot stops responding even if the Signal-side leave didn't complete."""
+    wrapped = "group." + base64.b64encode(group_id.encode()).decode()
+    url = f"{SIGNAL_SERVICE}/v1/groups/{BOT_NUMBER}/{wrapped}/quit"
+    try:
+        r = requests.post(url, timeout=10)
+        if r.ok:
+            log.info("Left Signal group: %s", group_id)
+            return True
+        log.warning("quit_signal_group HTTP %s body=%s",
+                    r.status_code, r.text[:300])
+        return False
+    except Exception as exc:
+        log.error("quit_signal_group error: %s", exc)
+        return False
+
 def send_with_attachment(recipient: str, text: str, filepath: Path):
     try:
         b64 = base64.b64encode(filepath.read_bytes()).decode()
@@ -701,15 +758,20 @@ DOC_HELP = (
     "`/doc share`                        — send default doc as a file *(admin)*\n"
     "`/doc edit <instruction>`           — AI-edit default doc *(admin)*\n"
     "`/doc edit --long <instruction>`    — AI-edit with larger output cap *(admin)*\n"
+    "`/doc backup`                       — manually snapshot current state to .bak *(admin)*\n"
+    "`/doc restore`                      — undo the most recent edit (swap with .bak) *(admin)*\n"
     "`/doc create <name>`                — create new doc *(admin)*\n"
     "`/doc <name>`                       — view named doc\n"
     "`/doc <name> status`                — named doc info\n"
     "`/doc <name> share`                 — send named doc as a file *(admin)*\n"
     "`/doc <name> edit <instruction>`    — AI-edit named doc *(admin)*\n"
+    "`/doc <name> backup`                — manually snapshot current state *(admin)*\n"
+    "`/doc <name> restore`               — undo the most recent edit *(admin)*\n"
     "`/doc <name> delete`                — delete named doc *(admin)*\n\n"
     "`--long` raises the per-edit output cap for legitimate large rewrites.\n"
-    "Doc names: letters, digits, `_`, `-`. Each chat (group or DM) has its\n"
-    "own independent document set."
+    "`restore` swaps the doc with its `.bak`; running it twice gives you\n"
+    "a one-step undo/redo. Doc names: letters, digits, `_`, `-`. Each\n"
+    "chat (group or DM) has its own independent document set."
 )
 
 
@@ -791,6 +853,79 @@ def _doc_delete(recipient: str, group_key: str, name: str,
         send(recipient, f"🗑️ Deleted `{name}`.")
     else:
         send(recipient, f"⚠️ No document named `{name}`.")
+
+
+def _doc_restore(recipient: str, group_key: str, name: str,
+                 source: str, source_uuid: str):
+    """Restore a document from its .bak file (the snapshot taken before the
+    most recent /doc edit). Going through write_doc means the current state
+    is itself backed up first — so restoring twice in a row toggles between
+    the two states, effectively giving a one-step undo/redo."""
+    if not is_admin(source, source_uuid, group_key):
+        send(recipient, "🔒 Only admins can restore documents.")
+        log.info("Restore denied source=%s uuid=%s", source, source_uuid)
+        return
+
+    path   = _doc_path(group_key, name)
+    backup = path.with_suffix(".md.bak")
+
+    if not path.exists():
+        send(recipient, f"❌ No document named `{name}`.")
+        return
+    if not backup.exists():
+        send(recipient,
+             f"❌ No backup found for `{name}`. Backups are created automatically "
+             f"on `/doc edit` — there's nothing to restore from yet.")
+        return
+
+    try:
+        backup_content = backup.read_text()
+        old_doc        = path.read_text()
+        write_doc(group_key, name, backup_content)
+        old_lines = len(old_doc.splitlines())
+        new_lines = len(backup_content.splitlines())
+        delta     = new_lines - old_lines
+        sign      = f"+{delta}" if delta > 0 else str(delta)
+        log.info("Doc restored: %s/%s by source=%s", group_key, name, source)
+        send(recipient,
+             f"↩️ Restored `{name}` from backup. Lines: {old_lines} → {new_lines} ({sign})\n"
+             f"_Run the same command again to undo this restore._\n\n"
+             f"{doc_status(group_key, name)}")
+    except ValueError as exc:
+        log.warning("Restore rejected (source=%s): %s", source, exc)
+        send(recipient, f"❌ Restore failed: {exc}")
+    except Exception as exc:
+        log.error("Restore failed: %s", exc)
+        send(recipient, "❌ Restore failed. Please try again.")
+
+
+def _doc_backup(recipient: str, group_key: str, name: str,
+                source: str, source_uuid: str):
+    """Manually capture the doc's current state to its .bak. Useful for
+    pinning a known-good state before risky edits, independent of the
+    automatic pre-edit backup. Overwrites any existing .bak."""
+    if not is_admin(source, source_uuid, group_key):
+        send(recipient, "🔒 Only admins can back up documents.")
+        log.info("Backup denied source=%s uuid=%s", source, source_uuid)
+        return
+
+    path = _doc_path(group_key, name)
+    if not path.exists():
+        send(recipient, f"❌ No document named `{name}`.")
+        return
+
+    backup = path.with_suffix(".md.bak")
+    backup_existed = backup.exists()
+    backup.write_text(path.read_text())
+    log.info("Doc backed up: %s/%s by source=%s (overwrote=%s)",
+             group_key, name, source, backup_existed)
+
+    name_arg = "" if name == DEFAULT_DOC_NAME else f" {name}"
+    note = (" Replaced the previous backup." if backup_existed
+            else " (No prior backup existed.)")
+    send(recipient,
+         f"💾 Snapshot of `{name}` saved to backup.{note}\n"
+         f"Run `/doc{name_arg} restore` later to revert to this state.")
 
 
 def _doc_edit(recipient: str, group_key: str, name: str, raw_instruction: str,
@@ -893,7 +1028,7 @@ def handle_doc(recipient: str, args: str, source: str, source_uuid: str,
         return
 
     # Verbs operating on the default doc: /doc <verb> ...
-    if first in ("view", "status", "share", "edit", "delete"):
+    if first in ("view", "status", "share", "edit", "delete", "restore", "backup"):
         if first == "delete":
             send(recipient, "❌ Use `/doc <name> delete` to delete a named doc.")
             return
@@ -916,12 +1051,12 @@ def handle_doc(recipient: str, args: str, source: str, source_uuid: str,
     verb      = sub_parts[0].lower()
     verb_args = sub_parts[1] if len(sub_parts) > 1 else ""
 
-    if verb in ("view", "status", "share", "edit", "delete"):
+    if verb in ("view", "status", "share", "edit", "delete", "restore", "backup"):
         _dispatch_doc_verb(recipient, group_key, doc_name, verb, verb_args,
                            source, source_uuid)
     else:
         send(recipient,
-             f"❌ Unknown verb `{verb}`. Try: view, edit, share, status, delete.")
+             f"❌ Unknown verb `{verb}`. Try: view, edit, share, status, backup, restore, delete.")
 
 
 def _dispatch_doc_verb(recipient: str, group_key: str, name: str, verb: str,
@@ -940,6 +1075,10 @@ def _dispatch_doc_verb(recipient: str, group_key: str, name: str, verb: str,
         _doc_edit(recipient, group_key, name, verb_args, source, source_uuid)
     elif verb == "delete":
         _doc_delete(recipient, group_key, name, source, source_uuid)
+    elif verb == "restore":
+        _doc_restore(recipient, group_key, name, source, source_uuid)
+    elif verb == "backup":
+        _doc_backup(recipient, group_key, name, source, source_uuid)
 
 
 def handle_mention(recipient: str, query: str):
@@ -1088,11 +1227,45 @@ def route(envelope: dict):
                  source, group_id)
         return
 
-    # /group leave — owner removes the current group from the approved set.
+    # /group leave — owner has the bot exit cleanly:
+    #   1. Pack the group's docs into a tar.gz so the group keeps a copy
+    #   2. Send the archive + a goodbye text (must happen while still a member)
+    #   3. Remove from groups.txt (stop responding)
+    #   4. Quit the group on Signal's side (leave member list)
+    #   5. Delete the group's local doc directory (free disk + remove residue)
     if text.strip().startswith("/group leave") and is_owner(source, source_uuid):
+        gkey = _group_key(group_id, is_dm=False)
+
+        archive = None
+        try:
+            archive = pack_group_docs(gkey)
+        except Exception as exc:
+            log.error("pack_group_docs failed for %s: %s", gkey, exc)
+
+        if archive:
+            send_with_attachment(recipient,
+                                 "📦 Documents from this group (saved before I leave):",
+                                 archive)
+        send(recipient, "👋 Group released. Leaving the group now.")
+
         _remove_known_group(group_id)
         log.info("Group released: %s by owner=%s", group_id, source)
-        send(recipient, "👋 Group released. I'll stop responding here.")
+
+        if not quit_signal_group(group_id):
+            log.warning("Signal-side group quit failed for %s — local state cleared but bot may still appear in member list",
+                        group_id)
+
+        # Local cleanup. Errors are logged but non-fatal — groups.txt removal
+        # already stopped the bot from responding here.
+        try:
+            delete_group_docs(gkey)
+        except Exception as exc:
+            log.error("delete_group_docs failed for %s: %s", gkey, exc)
+        if archive:
+            try:
+                archive.unlink(missing_ok=True)
+            except Exception as exc:
+                log.warning("Could not unlink archive %s: %s", archive, exc)
         return
 
     group_key = _group_key(group_id, is_dm=False)

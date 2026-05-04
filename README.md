@@ -19,9 +19,11 @@ Each chat (group or DM) has its own independent document set, and admins can kee
 | `/doc share` | Group + DM | Admins (group) / owner (DM) | Send default doc as a file |
 | `/doc edit <instruction>` | Group + DM | Admins (group) / owner (DM) | AI-rewrites default doc |
 | `/doc edit --long <instruction>` | Group + DM | Admins | Same, with a larger output cap (`LLM_LARGE_MAX_TOKENS`) |
+| `/doc backup` | Group + DM | Admins (group) / owner (DM) | Manually snapshot current state to `.bak` (overwrites previous backup) |
+| `/doc restore` | Group + DM | Admins (group) / owner (DM) | Undo the last edit by swapping with `.bak`; running it twice toggles back |
 | `/doc create <name>` | Group + DM | Admins | Create a new named document |
 | `/doc <name>` | Group + DM | Everyone | View named doc |
-| `/doc <name> <verb>` *(view/status/share/edit/delete)* | Group + DM | Per-verb (admin for write/share) | Operate on named doc |
+| `/doc <name> <verb>` *(view/status/share/edit/backup/restore/delete)* | Group + DM | Per-verb (admin for write/share/backup/restore) | Operate on named doc |
 | `/group claim` | Group only | Owner | Approves the current group for bot use |
 | `/group leave` | Group only | Owner | Removes the current group from approved set |
 | `/admins` | Group + DM | Admins (group) / owner (DM) | List the owner and this group's admins |
